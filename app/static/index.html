@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>AgentMemory Desktop</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">AgentMemory <span>Desktop</span></div>
+  <div id="headerStatus" class="header-status">检查中…</div>
+</header>
+
+<main>
+  <!-- ============ 首启向导 ============ -->
+  <section id="wizard" class="hidden">
+    <div class="steps-bar">
+      <div class="step active" data-s="1"><i>1</i>选择模型</div>
+      <div class="step" data-s="2"><i>2</i>接入客户端</div>
+      <div class="step" data-s="3"><i>3</i>完成</div>
+    </div>
+
+    <!-- 步骤 1：模型 -->
+    <div class="panel" id="step1">
+      <h2>工人模型</h2>
+      <p class="hint">记忆提炼（L1–L3）需要一个 OpenAI 兼容的大模型端点。推荐 SiliconFlow 免费档。</p>
+      <label>服务商</label>
+      <select id="provider">
+        <option value="siliconflow" selected>SiliconFlow（硅基流动）</option>
+        <option value="custom">自定义 OpenAI 兼容端点</option>
+      </select>
+      <label>Base URL</label>
+      <input id="baseUrl" value="https://api.siliconflow.cn/v1" placeholder="https://.../v1">
+      <label>模型</label>
+      <input id="model" list="modelList" value="Qwen/Qwen3-VL-8B-Instruct">
+      <datalist id="modelList">
+        <option value="Qwen/Qwen3-VL-8B-Instruct">
+        <option value="Qwen/Qwen2.5-7B-Instruct">
+        <option value="THUDM/glm-4-9b-chat">
+      </datalist>
+      <label>API Key</label>
+      <input id="apiKey" type="password" placeholder="sk-...">
+      <button id="testModelBtn" class="secondary">测试连接</button>
+      <div id="testResult" class="test-result"></div>
+      <div class="nav">
+        <span></span>
+        <button id="toStep2" class="primary" disabled>下一步</button>
+      </div>
+    </div>
+
+    <!-- 步骤 2：客户端 -->
+    <div class="panel hidden" id="step2">
+      <h2>接入 Agent 客户端</h2>
+      <p class="hint">勾选要接入的客户端：能自动写入的会自动配置（改前自动备份），TRAE 需手动粘贴一次。</p>
+      <div id="clientList" class="client-list"></div>
+      <div id="traeBox" class="trae-box hidden">
+        <p>TRAE 配置：打开 <b>设置中心 → MCP → 添加 → 手动添加</b>，粘贴：</p>
+        <pre id="traeJson"></pre>
+        <button id="copyTrae" class="secondary">一键复制</button>
+        <span id="copyOk" class="copy-ok hidden">已复制 ✓</span>
+      </div>
+      <label>数据目录（记忆存放位置）</label>
+      <input id="dataDir" placeholder="留空使用默认">
+      <p class="hint">已有旧数据（如 Q:/agent-memory-data/memory-tdai）可填原路径直接挂载。</p>
+      <div class="nav">
+        <button id="back1" class="secondary">上一步</button>
+        <button id="toStep3" class="primary">下一步</button>
+      </div>
+    </div>
+
+    <!-- 步骤 3：完成 -->
+    <div class="panel hidden" id="step3">
+      <h2>启动</h2>
+      <p class="hint">生成配置并启动记忆内核（首次约需 30–60 秒）。</p>
+      <button id="finishBtn" class="primary big">生成配置并启动</button>
+      <div id="finishLog" class="finish-log"></div>
+      <div id="doneBox" class="done-box hidden">
+        <p>✅ 记忆系统已就绪。</p>
+        <button id="gotoConsole" class="primary">进入控制台</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 控制台 ============ -->
+  <section id="console" class="hidden">
+    <div class="cards" id="cardsRoot">
+      <div class="card" id="cardGateway">
+        <h3>记忆内核</h3>
+        <div id="gatewayState">—</div>
+        <div id="dailyStats" class="config-info dim">今日新增 L0：— · 今日提炼：—</div>
+        <button id="kernelStartBtn" class="secondary">启动</button>
+        <button id="kernelStopBtn" class="secondary">停止</button>
+        <div class="autostart-row">
+          <span class="dim">开机自启 + 守护 <b id="autostartState"></b></span>
+          <label class="switch"><input type="checkbox" id="autostartBtn"><span class="slider"></span></label>
+        </div>
+        <p class="hint">开启后随 Windows 启动：托盘常驻图标（左键点开管理界面）+ Web 服务挂掉（如 TRAE 更新）30 秒内自动拉起。</p>
+      </div>
+      <div class="card">
+        <h3>当前配置</h3>
+        <div id="configInfo" class="config-info">—</div>
+        <button id="editCfgBtn" class="secondary">修改模型配置</button>
+        <div id="cfgForm" class="cfg-form hidden">
+          <input id="editBaseUrl" placeholder="Base URL（如 https://api.stepfun.com/step_plan/v1）">
+          <input id="editApiKey" placeholder="API Key">
+          <input id="editModel" placeholder="模型名（如 step-3.7-flash）">
+          <div class="cfg-ops">
+            <button id="testModelBtn2" class="secondary">测试连接</button>
+            <button id="saveCfgBtn" class="primary">保存并重启内核</button>
+          </div>
+          <div id="cfgTestResult" class="hint"></div>
+        </div>
+      </div>
+      <div class="card">
+        <h3>闭环自测</h3>
+        <p class="hint">存一句话 → 再搜它，验证记忆闭环。</p>
+        <input id="testContent" placeholder="例如：自测代号 TEST-001">
+        <button id="captureBtn" class="secondary">存入</button>
+        <input id="testQuery" placeholder="搜索关键词">
+        <button id="searchBtn" class="secondary">搜索</button>
+        <div id="loopResult" class="loop-result"></div>
+      </div>
+      <div class="card wide">
+        <h3>MD 批量导入</h3>
+        <p class="hint">自动识别格式：聊天记录导出逐轮导入，普通文档按章节切块导入；逐轮等待提炼防丢批，导入内容自动脱敏（密钥/令牌打码）。</p>
+        <details class="fmt-details">
+          <summary>支持的 MD 格式示例</summary>
+          <pre class="fmt-pre">【格式一：聊天记录导出】（TRAE/Claude 会话导出）
+### 用户 · 2026-08-11 12:44:08
+帮我确认软件版本
+### 助手 · 2026-08-11 12:44:25
+不是最新版本，最新是 v4.0.1……
+
+【格式二：普通文档】（自动按 ## 章节切块）
+# 文档标题
+## 第一章
+正文内容……
+## 第二章
+正文内容……</pre>
+        </details>
+        <div class="import-row">
+          <input id="importDir" placeholder="聊天记录导出目录（如 D:/导出/某会话目录）">
+          <button id="scanBtn" class="secondary">扫描</button>
+        </div>
+        <div id="scanResult" class="scan-result"></div>
+        <div id="previewResult" class="preview-result hidden"></div>
+        <div id="importProgress" class="import-progress hidden">
+          <div class="bar"><div id="barFill"></div></div>
+          <div id="progressText"></div>
+          <button id="abortBtn" class="secondary">中止</button>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>从 WorkBuddy / Qwen 导入</h3>
+        <p class="hint">自动扫描本机 WorkBuddy 与千问工作区的本地会话（JSONL），按项目合并后逐轮导入记忆。每个项目一个 session_key（import-wb- / import-qw- 前缀），已导入过的项目默认不勾选。</p>
+        <div class="import-row">
+          <button id="toolScanBtn" class="secondary">扫描 WorkBuddy + Qwen 项目</button>
+        </div>
+        <div id="toolScanResult" class="scan-result"></div>
+        <div id="toolImportProgress" class="import-progress hidden">
+          <div class="bar"><div id="toolBarFill"></div></div>
+          <div id="toolProgressText"></div>
+          <button id="toolAbortBtn" class="secondary">中止</button>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>备份与迁移</h3>
+        <p class="hint">记忆库 = <b id="backupDataDir">数据目录</b> 整个文件夹（SQLite + 对话流水 + 画像）。导出会先停内核再打包，保证数据库一致；恢复前自动把当前记忆库滚存一份到 backup 目录（后悔药）。</p>
+        <div class="import-row">
+          <button id="exportBtn" class="secondary">导出记忆库（下载 zip）</button>
+          <button id="importBackupBtn" class="secondary">从 zip 恢复记忆库</button>
+          <input type="file" id="restoreFile" accept=".zip" class="hidden">
+        </div>
+        <div id="backupResult" class="config-info dim"></div>
+      </div>
+      <div class="card wide" id="cardMemories">
+        <h3>记忆管理 <span id="memStats" class="mem-stats">L0 - · L1 - · L2 -</span></h3>
+        <div class="tabs">
+          <button class="tab active" data-tab="l0">L0 对话</button>
+          <button class="tab" data-tab="l1">L1 记忆</button>
+          <button class="tab" data-tab="l2">L2 场景</button>
+          <button class="tab" data-tab="l3">L3 画像</button>
+        </div>
+        <details class="fmt-details">
+          <summary>四层记忆是什么？</summary>
+          <pre class="fmt-pre">L0 对话流水：原始问答原文，按日期存于 conversations/日期.jsonl
+L1 原子记忆：从对话提炼出的单条事实（偏好/决策/技术栈），可在此编辑和删除——改这里，下次提炼会自动同步到 L2/L3
+L2 场景记忆：按主题归类的 MD 文件（如"盲人导航项目"），内核自动维护，只读
+L3 用户画像：长期沉淀的用户理解（persona.md），内核自动生成，只读
+想改记忆改 L1；直接手改 L2/L3 文件可能被下次提炼覆盖。</pre>
+        </details>
+        <div id="tab-l0">
+          <div class="import-row">
+            <input id="l0Query" placeholder="搜索原始对话（留空则浏览流水）">
+            <button id="l0Load" class="secondary">查询</button>
+          </div>
+          <div id="l0List" class="mem-list"></div>
+        </div>
+        <div id="tab-l1" class="hidden">
+          <div class="import-row">
+            <input id="l1Query" placeholder="搜索 L1 记忆（留空则浏览列表）">
+            <select id="l1Type"><option value="">全部类型</option><option value="episodic">episodic</option><option value="persona">persona</option><option value="instruction">instruction</option></select>
+            <button id="l1Load" class="secondary">查询</button>
+            <button id="l1Delete" class="danger">删除勾选</button>
+          </div>
+          <div id="l1List" class="mem-list"></div>
+          <div id="l1More" class="hidden"><button id="l1MoreBtn" class="secondary">加载更多</button></div>
+        </div>
+        <div id="tab-l2" class="hidden">
+          <div id="l2List" class="mem-list"></div>
+          <pre id="l2Content" class="l2-content hidden"></pre>
+        </div>
+        <div id="tab-l3" class="hidden">
+          <p class="hint">L3 用户画像：内核根据长期对话沉淀的用户理解，只读。</p>
+          <pre id="l3Content" class="l2-content"></pre>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>客户端接入（TRAE / WorkBuddy / 其他）</h3>
+        <p class="hint">会话标识（session_key）：记忆的“档案柜名”。多个客户端填同一个标识，记忆才会聚到同一空间。</p>
+        <div class="import-row">
+          <input id="sessionKeyInput" placeholder="如 tianzi（所有客户端共用同一个）">
+          <button id="sessionKeySave" class="secondary">确认</button>
+        </div>
+        <div id="httpBridgeState" class="config-info dim">HTTP 桥（豆包用）：检测中…</div>
+        <p class="hint">豆包等只支持「服务器 URL」的客户端：设置 → 自定义连接器 → 名称填 <b>agent-memory</b>、URL 填 <b>http://127.0.0.1:8410/mcp</b>、传输类型 HTTP、Headers 留空，保存后用上面同一个 session_key 的规则文本即可。</p>
+        <p class="hint">懒人模式：勾选客户端后点写入（写入前自动备份原文件，只动 agent-memory 一项，其他 MCP 原样保留）。TRAE 没有本地配置文件，仍需手动粘贴。</p>
+        <div id="injectPick" class="client-list"></div>
+        <button id="injectBtn" class="secondary" disabled>写入勾选的客户端</button>
+        <div id="injectResult" class="config-info dim"></div>
+        <p class="hint">第一步：把 MCP 配置 JSON 添加到客户端的 MCP 服务器设置。路径已按本机自动生成——换电脑或移动软件文件夹后，在新机的本页面重新复制一次即可，无需手改。</p>
+        <button id="showTrae" class="secondary">显示配置 JSON</button>
+        <div id="traeModal" class="trae-box hidden">
+          <pre id="traeJson2"></pre>
+          <button id="copyTrae2" class="secondary">一键复制</button>
+        </div>
+        <p class="hint">第二步：把记忆规则粘贴到客户端的自定义指令 / 提示词设置（规则文本会自动带上上面设置的 session_key）</p>
+        <button id="showRule" class="secondary">显示记忆规则</button>
+        <div id="ruleBox" class="trae-box hidden">
+          <pre id="ruleText"></pre>
+          <button id="copyRule" class="secondary">一键复制</button>
+          <span id="ruleCopyOk" class="copy-ok hidden">已复制</span>
+        </div>
+      </div>
+      <div class="card wide">
+        <h3>卸载（不用了再来）</h3>
+        <p class="hint">依次执行：移除各客户端里的 agent-memory 配置（改前自动备份）→ 关闭开机自启与守护 → 停止内核与 HTTP 桥。软件文件夹需你手动删除（程序正在运行，不能删自己）。</p>
+        <div class="import-row">
+          <button id="uninstallPlanBtn" class="secondary">检查卸载影响</button>
+          <button id="uninstallBtn" class="danger">开始卸载</button>
+        </div>
+        <label class="danger-label"><input type="checkbox" id="uninstallRemoveData"> 同时删除全部记忆数据（<b>不可恢复</b>，建议先点上方「导出记忆库」备份）</label>
+        <div id="uninstallResult" class="config-info dim"></div>
+      </div>
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
