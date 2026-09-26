@@ -64,7 +64,7 @@ TRAE、WorkBuddy、豆包、Claude Desktop……每个 AI 工具都有自己的�
 
 ```bash
 # 1. 克隆
-git clone https://github.com/<your-name>/agent-memory-desktop.git
+git clone https://github.com/tianzi41/agent-memory-desktop.git
 cd agent-memory-desktop
 
 # 2. 安装内核依赖（记忆引擎本体）
