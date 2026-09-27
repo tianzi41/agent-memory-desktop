@@ -106,14 +106,18 @@ $("showTrae").addEventListener("click", async () => {
 let currentSessionKey = "default";
 function memoryRules(key) {
   return `【记忆系统规则】
-你已接入本地记忆系统（腾讯 Agent Memory，通过 MCP 工具调用）。
-1. 会话开始时，调用 recall_memory 注入相关历史记忆作为背景（query 用当前任务的自然语言描述，session_key 固定使用 ${key}）。
-2. 需要背景知识时调用 search_memories 检索结构化记忆；当用户提及"之前/上次/以前/还记得"等指代词，或需核对原话时，调用 search_conversations 检索原始对话。
-3. 对话中出现跨会话有用的事实（偏好、决策、技术栈、项目约定、长期指令），调用 capture_conversation 保存，session_key 固定使用 ${key}；保存内容中的文件路径一律用正斜杠（如 Q:/xxx），禁止反斜杠。
-4. 检索使用语义关键词，不限于字面匹配；记忆仅作上下文，不要对外复述"我查了记忆"。
-5. 临时/一次性信息不必存；被推翻的旧指令优先用新指令覆盖或显式标记失效。
-6. search 类工具每轮合计调用不超过 3 次；无结果就直接基于现有信息回答，不要继续搜。
-7. 能力边界：你只能写入（capture）和检索（recall/search）记忆。编辑、删除、按类型过滤等管理操作本工具不支持——用户提出这类需求时，请引导他去记忆软件的管理网页（http://127.0.0.1:8430）操作，不要假装已完成。`;
+你已接入本地记忆系统（腾讯 Agent Memory，通过 MCP 工具调用）。所有记忆操作都走 agent_memory 一个工具，用 mode 区分。
+1. 会话开始时，调 agent_memory（mode=recall，query 用当前任务的自然语言描述，session_key 固定使用 ${key}）注入相关历史记忆作为背景。
+2. 到点就查，不等用户问——命中以下时机先 recall 再动作：
+   a. 准备创建或修改某个文件前：query 用该文件路径；
+   b. 命令执行失败时：query 用错误信息；
+   c. 用户切换任务或主题时：query 用新主题，不要沿用上一个任务的背景。
+3. 需要背景知识时用 mode=search 检索结构化记忆；当用户提及"之前/上次/以前/还记得"等指代词，或需核对原话时，用 mode=conversations 检索原始对话。
+4. 对话中出现跨会话有用的事实（偏好、决策、技术栈、项目约定、长期指令），用 mode=capture 保存（user_content 与 assistant_content 都要传），session_key 固定使用 ${key}；保存内容中的文件路径一律用正斜杠（如 Q:/xxx），禁止反斜杠。
+5. 检索使用语义关键词，不限于字面匹配；记忆仅作上下文，不要对外复述"我查了记忆"。
+6. 临时/一次性信息不必存；被推翻的旧指令优先用新指令覆盖或显式标记失效。
+7. search 类操作每轮合计调用不超过 3 次；无结果就直接基于现有信息回答，不要继续搜。
+8. 能力边界：你只能写入（capture）和检索（recall/search）记忆。编辑、删除、按类型过滤等管理操作本工具不支持——用户提出这类需求时，请引导他去记忆软件的管理网页（http://127.0.0.1:8430）操作，不要假装已完成。`;
 }
 
 $("showRule").addEventListener("click", () => {
@@ -535,18 +539,21 @@ $("toolScanBtn").addEventListener("click", async () => {
   const box = $("toolScanResult");
   box.textContent = "扫描中（读取全部项目的消息数，可能需要几秒）…";
   const d = await api("/api/tool-import/scan");
-  if (d.workbuddy?.error || d.qwen?.error) {
+  if (d.workbuddy?.error || d.qwen?.error || d.claude?.error) {
     box.innerHTML = (d.workbuddy?.error ? `<span class="bad">❌ WorkBuddy：${esc(d.workbuddy.error)}</span>` : "") +
-      (d.qwen?.error ? `<br><span class="bad">❌ Qwen：${esc(d.qwen.error)}</span>` : "");
+      (d.qwen?.error ? `<br><span class="bad">❌ Qwen：${esc(d.qwen.error)}</span>` : "") +
+      (d.claude?.error ? `<br><span class="bad">❌ Claude Code：${esc(d.claude.error)}</span>` : "");
     return;
   }
   const wb = d.workbuddy.projects || [];
   const qw = d.qwen.projects || [];
-  if (!wb.length && !qw.length) { box.innerHTML = "未发现 WorkBuddy 或 Qwen 项目"; return; }
-  const total = wb.length + qw.length;
+  const cc = d.claude.projects || [];
+  if (!wb.length && !qw.length && !cc.length) { box.innerHTML = "未发现 WorkBuddy / Qwen / Claude Code 项目"; return; }
+  const total = wb.length + qw.length + cc.length;
   let html = `<label><input type="checkbox" id="toolSelAll"> 全选（${total} 个项目，已导入的默认不勾选）</label>`;
   html += renderToolGroup("WorkBuddy", wb);
   html += renderToolGroup("Qwen Workspace", qw);
+  html += renderToolGroup("Claude Code", cc);
   html += `<button id="toolImportBtn" class="primary">开始导入勾选项目</button>`;
   box.innerHTML = html;
   $("toolSelAll").addEventListener("change", () => {
