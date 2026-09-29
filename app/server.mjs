@@ -205,12 +205,16 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/kernel/start" && req.method === "POST") {
+      kernelStoppedByUser = false; // 用户显式启动：看护恢复管辖权
+      kernelHealthMiss = 0;
       const k = await startKernel();
       json(res, 200, k);
       return;
     }
 
     if (url.pathname === "/api/kernel/stop" && req.method === "POST") {
+      kernelStoppedByUser = true; // 手动停止：看护不插手，直到用户点启动
+      kernelHealthMiss = 0;
       json(res, 200, { stopped: stopKernel() });
       return;
     }
@@ -424,6 +428,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (url.pathname === "/api/uninstall" && req.method === "POST") {
+      kernelStoppedByUser = true; // 卸载途中禁止看护复活内核
       const body = await readBody(req);
       const r = await runUninstall({ removeData: !!body.removeData });
       json(res, 200, r);
@@ -446,11 +451,43 @@ async function sampleDailyStats() {
       health(8000).catch(() => null),
     ]);
     const pw = h?.body?.services?.pipelineWorker; // health() 返回 {ok,status,body} 包装，真身在 body
+    // 看护计数：采到健康就归零，连续 miss 到阈值交给 watchdogKernel 决断
+    if (h?.ok) kernelHealthMiss = 0; else kernelHealthMiss++;
+    if (kernelHealthMiss >= 2) await watchdogKernel();
     const l0Total = l0r?.body?.data?.total;
     if (typeof l0Total !== "number" && !pw) return getDaily(); // 内核不在：不采样，返回累计值
     return updateDaily({ l0Total, tasksDone: pw?.tasksCompleted, tasksFailed: pw?.tasksFailed });
   } catch {
     return getDaily();
+  }
+}
+
+// 内核看护：watchdog.ps1 只保 Web(8430)，内核(8420)死了没人拉——页面会一直显示"未运行"。
+// 这里借 20s 统计轮询顺带自愈：连续两次采不到健康就重启。
+// 三道闸：(1) 手动点过「停止」则不插手，避免跟用户意图打架；
+//         (2) 重启后冷却 2 分钟，防反复失败变成重启风暴；
+//         (3) 重启过程中不并发触发，否则会 spawn 出多个内核进程。
+let kernelHealthMiss = 0;
+let kernelStoppedByUser = false;
+let kernelRestarting = false;
+let kernelLastRestartAt = 0;
+
+async function watchdogKernel() {
+  if (kernelStoppedByUser || kernelRestarting) return;
+  if (!loadAppConfig()) return; // 未完成向导：没有配置可拉，startKernel 会抛
+  if (Date.now() - kernelLastRestartAt < 120_000) return; // 冷却中
+  kernelRestarting = true;
+  try {
+    console.log("[watchdog] kernel unhealthy (miss=" + kernelHealthMiss + "), restarting...");
+    const k = await startKernel();
+    kernelLastRestartAt = Date.now();
+    kernelHealthMiss = 0;
+    console.log("[watchdog] kernel restart " + (k.healthy ? "ok" : "started but unhealthy"));
+  } catch (e) {
+    kernelLastRestartAt = Date.now();
+    console.error("[watchdog] kernel restart failed: " + String(e.message || e));
+  } finally {
+    kernelRestarting = false;
   }
 }
 

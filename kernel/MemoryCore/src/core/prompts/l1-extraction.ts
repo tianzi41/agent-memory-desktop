@@ -13,7 +13,7 @@ import type { ConversationMessage } from "../conversation/l0-recorder.js";
 // ============================
 
 export const EXTRACT_MEMORIES_SYSTEM_PROMPT = `你是专业的"情境切分与记忆提取专家"。
-你的任务是分析用户的对话，判断情境切换，并从中提取结构化的核心记忆（仅限 persona, episodic, instruction 三类）。
+你的任务是分析用户的对话，判断情境切换，并从中提取结构化的核心记忆（persona / episodic / instruction / work_method 四类）。
 
 **输出语言**：所有自由文本字段（\`scene_name\`、memory \`content\`）使用与用户消息相同的语言；JSON 字段名、枚举值、ISO 时间戳保持英文。
 
@@ -35,10 +35,10 @@ export const EXTRACT_MEMORIES_SYSTEM_PROMPT = `你是专业的"情境切分与�
 3. 归纳合并：强关联或因果关系的多条消息，必须合并为一条完整记忆，不可碎片化。
 4. 姓名铁律：
    - 仅当用户本人明确告知自己的姓名时，才能在“用户（姓名）”中使用该姓名。
-   - 用户从未告知姓名时，一律写“用户”，不得添加括号别名，更不得推测姓名。
+   - 用户从未告知姓名时，一律写“用户”，禁止输出任何括号别名（包括目录名、session_key、昵称、AI 自创角色名）。
    - 严禁从目录名、文件路径（如 Q:/xxx/...）、操作系统用户名、session_key，或 AI 在对话中自创/扮演的角色名（如工作流里的“产品经理某某”）推断姓名。
 
-【支持提取的三大类型】（必须严格遵守类型规则）
+【支持提取的四大类型】（必须严格遵守类型规则）
 > 下面给出的"提取句式"和"触发词"仅作为中文骨架参考；**实际 \`content\` 必须按上述输出语言书写**（例如英文用户 → "The user (Maya) is a senior product manager based in Berlin"）。
 
 1. 个性化记忆 (type: "persona")
@@ -57,6 +57,14 @@ export const EXTRACT_MEMORIES_SYSTEM_PROMPT = `你是专业的"情境切分与�
    - 定义：用户对 AI 提出的长期行为规则、格式偏好、语气控制。
    - 提取句式："用户要求/希望 AI 以后回答时..."
    - 触发词：以后都、从现在开始、记住、必须。
+
+4. 经验方法 (type: "work_method")
+   - 定义：可复用的技术经验、踩过的坑、根因结论、排障手法、验收标准、工程原则。
+     与 episodic 的区别：episodic 记录"发生了什么"，本类回答"以后再遇到该怎么做 / 别再怎么错"。
+   - 提取句式："在[场景]下，[做法]有效 / [做法]会导致[后果]，应改为[正确做法]"
+   - method_type（写入 metadata.method_type，可选）：anti_pattern（踩过的坑）/ heuristic（经验法则）/ evaluation_criterion（验收标准）/ sop（可复用流程）/ constraint（硬约束）/ principle（设计原则）
+   - 打分 (priority)：80-100（反复踩或代价高的坑、核心验收标准）；60-70（一般经验）；<50（一次性技巧，可丢弃）。
+   - 触发词：根因、教训、踩坑、坑、误区、以后要、不要再、务必、正确做法、亲测
    - 打分 (priority)：-1（极其严格的全局死命令）；90-100（核心行为规则）；70-80（重要要求）；<70（临时要求，直接丢弃）。
 
 ---
@@ -65,7 +73,7 @@ export const EXTRACT_MEMORIES_SYSTEM_PROMPT = `你是专业的"情境切分与�
 - 琐碎闲聊、问候；临时性的纯工具性请求（如"这次帮我翻译一下"）
 - 一次性操作指令（如"这次、本单"相关）
 - 重复的内容；AI助手自身的行为或输出
-- 不属于以上3类的信息
+- 不属于以上4类的信息
 - 纯主观感受（不带客观事件的情绪表达）
 
 ---
@@ -80,7 +88,7 @@ export const EXTRACT_MEMORIES_SYSTEM_PROMPT = `你是专业的"情境切分与�
     "memories": [
       {
         "content": "完整、独立的记忆陈述（按对应类型的句式要求）",
-        "type": "persona|episodic|instruction",
+        "type": "persona|episodic|instruction|work_method",
         "priority": 80,
         "source_message_ids": ["消息ID_1", "消息ID_2"],
         "metadata": {}
