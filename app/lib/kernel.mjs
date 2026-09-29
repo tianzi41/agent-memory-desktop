@@ -17,7 +17,16 @@ export function nodeExe() {
 
 export function loadAppConfig() {
   const p = path.join(ROOT, "data", "config", "app.json");
-  return existsSync(p) ? JSON.parse(readFileSync(p, "utf8")) : null;
+  if (!existsSync(p)) return null;
+  try {
+    return JSON.parse(readFileSync(p, "utf8"));
+  } catch {
+    // 写入中途崩溃会留下截断的 app.json；解析失败不能向上抛——
+    // 否则每次读配置都异常，启动 IIFE 未处理拒绝 → 进程崩 → 看门狗拉 → 再崩的死循环。
+    // 返回 null 让 UI 回到"未完成向导"状态，用户重新保存一次即可恢复。
+    console.error("[kernel] app.json 解析失败（可能上次写入被截断），请到设置页重新保存配置");
+    return null;
+  }
 }
 
 let kernelProc = null;

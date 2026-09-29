@@ -35,6 +35,9 @@ export async function startHttpBridge() {
   bridgeProc = spawn(pythonExe(), [script], {
     stdio: ["ignore", out, out],
     windowsHide: true,
+    // Windows 上重定向的 python stdout 默认用 GBK：中文日志变乱码，非 GBK 字符的
+    // traceback 甚至在日志 handler 内抛 UnicodeEncodeError。强制 UTF-8。
+    env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
   });
   bridgeProc.on("error", (e) => { console.error("[http-bridge] spawn error:", String(e.message || e)); bridgeProc = null; });
   bridgeProc.on("exit", () => { bridgeProc = null; });

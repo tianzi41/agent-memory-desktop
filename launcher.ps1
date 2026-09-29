@@ -27,12 +27,22 @@ if (Test-PortListening 8420) {
     Write-Host "[AgentMemory] Note: port 8420 busy - an external Gateway may be running." -ForegroundColor Yellow
 }
 
+# 清除停止哨兵：再次启动意味着看门狗恢复管辖权
+$stoppedFlag = Join-Path $root ".stopped"
+if (Test-Path $stoppedFlag) { Remove-Item $stoppedFlag -Force }
+
 Write-Host "[AgentMemory] starting Web UI on $url ..." -ForegroundColor Cyan
 $server = Join-Path $root "app\server.mjs"
 
 $logDir = Join-Path $root "logs"
 if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Path $logDir | Out-Null }
 $logFile = Join-Path $logDir "web.log"
+# Web 日志轮换：内核/bridge 有 10MB 轮转，web.log 曾完全无界增长
+foreach ($lf in @($logFile, "$logFile.err")) {
+    if ((Test-Path $lf) -and (Get-Item $lf).Length -gt 10MB) {
+        Move-Item $lf "$lf.1" -Force
+    }
+}
 
 $proc = Start-Process -FilePath $nodeExe -ArgumentList "`"$server`"" -WindowStyle Hidden -PassThru -RedirectStandardOutput $logFile -RedirectStandardError "$logFile.err"
 
@@ -52,6 +62,6 @@ if ($ok) {
     }
 } else {
     Write-Host "[AgentMemory] FAILED to start. See logs\web.log" -ForegroundColor Red
-    if (Test-Path "$logFile.err") { Get-Content "$logFile.err" | Select-Object -First 20 }
+    if (Test-Path "$logFile.err") { Get-Content "$logFile.err" -Tail 20 }
     exit 1
 }

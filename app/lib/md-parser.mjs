@@ -39,10 +39,10 @@ function redactSecrets(text) {
 }
 
 // Windows 盘符路径整体转正斜杠：Q:\a\b\c.py -> Q:/a/b/c.py
-// （只认"盘符: 后跟反斜杠段"的完整路径；段内允许空格以兼容 Program Files 类路径，
-//  遇中文/引号/换行即停，孤立 \d \n \frac 等代码转义不受影响）
+// （只认"盘符: 后跟反斜杠段"的完整路径；段内允许空格与中文以兼容中文目录，
+//  遇引号/换行/通配符即停，孤立 \d \n \frac 等代码转义不受影响）
 function normalizeWinPaths(text) {
-  return text.replace(/([A-Za-z]):((?:\\+[^\\"'`|<>*?\r\n\u4e00-\u9fff]+)+)/g, (m, drive, rest) => drive + ":" + rest.replace(/\\+/g, "/"));
+  return text.replace(/([A-Za-z]):((?:\\+[^\\"'`|<>*?\r\n]+)+)/g, (m, drive, rest) => drive + ":" + rest.replace(/\\+/g, "/"));
 }
 
 export function sanitizeContent(text) {
@@ -53,7 +53,9 @@ export function sanitizeContent(text) {
 export function scanDir(dir) {
   const sessions = [];
   if (!existsSync(dir)) return { error: "目录不存在" };
-  const entries = readdirSync(dir, { withFileTypes: true });
+  let entries;
+  try { entries = readdirSync(dir, { withFileTypes: true }); }
+  catch (e) { return { error: "目录读取失败: " + String(e.message || e) }; } // 比如传入的是文件路径（ENOTDIR）
   for (const e of entries) {
     if (!e.isDirectory()) {
       // 根目录下直接的 md 也收
@@ -63,7 +65,9 @@ export function scanDir(dir) {
       }
       continue;
     }
-    const sub = readdirSync(path.join(dir, e.name), { withFileTypes: true });
+    let sub;
+    try { sub = readdirSync(path.join(dir, e.name), { withFileTypes: true }); }
+    catch { continue; } // 单个子目录不可读不拖垮整次扫描
     for (const f of sub) {
       if (f.isFile() && f.name.endsWith(".md")) {
         const full = path.join(dir, e.name, f.name);

@@ -1,9 +1,9 @@
 // daily-stats.mjs — 今日统计：L0 新增条数 + 提炼任务完成/失败数（跨天自动清零）
 // 累加器规则：单调计数器取差量；遇计数器重置（内核重启归零）按"从 0 重新爬的部分"续算
 // 落盘 data/config/daily-stats.json：关页面/重启 Web/重启内核均不丢，跨天才清零
-import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
 import path from "node:path";
-import { configDir } from "./config-gen.mjs";
+import { configDir, writeFileAtomic } from "./config-gen.mjs";
 
 const FILE = path.join(configDir(), "daily-stats.json");
 
@@ -22,7 +22,7 @@ function load() {
 function save(s) {
   try {
     mkdirSync(configDir(), { recursive: true });
-    writeFileSync(FILE, JSON.stringify(s, null, 2), "utf8");
+    writeFileAtomic(FILE, JSON.stringify(s, null, 2));
   } catch { /* 落盘失败不阻塞内存统计 */ }
 }
 

@@ -16,14 +16,27 @@ let injected = false;
 // ---------- 初始化 ----------
 async function init() {
   const s = await api("/api/status");
+  if (s.error) {
+    $("headerStatus").textContent = "服务无响应";
+    $("headerStatus").className = "header-status bad";
+    return;
+  }
   $("headerStatus").textContent = s.gateway.healthy ? "内核运行中" : "内核未运行";
   $("headerStatus").className = "header-status " + (s.gateway.healthy ? "ok" : "bad");
   if (s.setupDone) { showConsole(s); } else { showWizard(); }
 }
 
+// 集中容错：网络失败、非 2xx、非 JSON 响应一律收敛成 { error } 形状返回，
+// 不再向上抛——未处理的拒绝会让整个页面脚本停摆（白页、无提示、不恢复）
 async function api(path, opts) {
-  const r = await fetch(path, opts);
-  return r.json();
+  try {
+    const r = await fetch(path, opts);
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok && j && typeof j === "object" && !("error" in j)) return { error: "HTTP " + r.status };
+    return j;
+  } catch (e) {
+    return { error: String(e.message || e) };
+  }
 }
 function post(path, body) {
   return api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
@@ -240,7 +253,7 @@ $("uninstallPlanBtn").addEventListener("click", async () => {
   const lines = [];
   lines.push(`客户端注入：${d.clients.length ? d.clients.map(c => `${c.name}${c.hasEntry ? "（有 agent-memory）" : "（无）"}`).join("、") : "无可注入客户端"}`);
   lines.push(`开机自启：${d.autostart.enabled ? "已启用（将移除 VBS 并停止守护）" : "未启用"}`);
-  lines.push(`记忆数据：${d.dataExists ? `${d.dataDir}（约 ${d.dataSizeKB} MB，${$("uninstallRemoveData").checked ? "勾选了删除 → 将删除" : "保留"}）` : "无数据目录"}`);
+  lines.push(`记忆数据：${d.dataExists ? `${d.dataDir}（约 ${(d.dataSizeKB / 1024).toFixed(1)} MB，${$("uninstallRemoveData").checked ? "勾选了删除 → 将删除" : "保留"}）` : "无数据目录"}`);
   out.innerHTML = lines.join("<br>");
 });
 
@@ -366,7 +379,7 @@ $("testModelBtn2").addEventListener("click", async () => {
     apiKey: $("editApiKey").value.trim(),
     model: $("editModel").value.trim(),
   });
-  out.innerHTML = d.ok ? `<span class="state-ok">✅ 连通（${d.ms}ms）</span>` : `<span class="state-bad">❌ ${d.error || "失败"}（${d.ms}ms）</span>`;
+  out.innerHTML = d.ok ? `<span class="state-ok">✅ 连通（${d.ms}ms）</span>` : `<span class="state-bad">❌ ${esc(d.error || "失败")}（${d.ms}ms）</span>`;
 });
 
 $("saveCfgBtn").addEventListener("click", async () => {
@@ -377,7 +390,7 @@ $("saveCfgBtn").addEventListener("click", async () => {
   out.textContent = "保存并重启内核中…";
   const d = await post("/api/config/update", { baseUrl, apiKey, model });
   if (d.ok) { out.innerHTML = `<span class="state-ok">✅ 已保存，内核重启中（${d.kernel?.ok ? "已拉起" : "启动中"}）</span>`; setTimeout(refresh, 4000); }
-  else { out.innerHTML = `<span class="state-bad">❌ ${d.error || "失败"}</span>`; }
+  else { out.innerHTML = `<span class="state-bad">❌ ${esc(d.error || "失败")}</span>`; }
 });
 
 $("kernelStartBtn").addEventListener("click", async () => { await post("/api/kernel/start"); setTimeout(refresh, 2500); });
@@ -403,6 +416,11 @@ $("autostartBtn").addEventListener("change", async () => {
 
 async function refresh() {
   const s = await api("/api/status");
+  if (s.error) {
+    $("headerStatus").textContent = "服务无响应";
+    $("headerStatus").className = "header-status bad";
+    return;
+  }
   $("headerStatus").textContent = s.gateway.healthy ? "内核运行中" : "内核未运行";
   $("headerStatus").className = "header-status " + (s.gateway.healthy ? "ok" : "bad");
   if (s.setupDone) renderStatus(s);
@@ -424,7 +442,7 @@ async function refreshDaily() {
   const el = $("dailyStats");
   if (!el) return;
   const d = await api("/api/daily-stats").catch(() => null);
-  if (!d) return;
+  if (!d || d.error) return;
   el.innerHTML =
     `今日新增 L0：<b>${d.l0Added}</b> 条 · 今日提炼：完成 <b>${d.tasksDone}</b> / 失败 <b>${d.tasksFailed}</b>`;
 }
@@ -446,14 +464,15 @@ $("searchBtn").addEventListener("click", async () => {
 });
 
 // ---------- M2：MD 导入 ----------
-let importTimer = null;
+let importTimer = null;      // MD 导入轮询句柄
+let toolImportTimer = null;  // 工具导入轮询句柄（曾共用 importTimer：互相覆盖 → 旧 interval 泄漏永久空转）
 
 $("scanBtn").addEventListener("click", async () => {
   const dir = $("importDir").value.trim();
   if (!dir) return;
   $("scanResult").textContent = "扫描中…";
   const d = await post("/api/import/scan", { dir });
-  if (d.error) { $("scanResult").innerHTML = `<span class="bad">❌ ${d.error}</span>`; return; }
+  if (d.error) { $("scanResult").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
   if (!d.total) { $("scanResult").innerHTML = "未发现 MD 文件（目录结构应为：会话目录/会话.md）"; return; }
   let html = `<label><input type="checkbox" id="selAll" checked> 全选（${d.total} 个文件，已导入的默认不勾选）</label><div class="file-list">`;
   d.sessions.forEach((s, i) => {
@@ -462,8 +481,8 @@ $("scanBtn").addEventListener("click", async () => {
     const mark = s.changed ? `<span class="tag-changed">${unit}数已变化</span>`
       : s.imported ? `<span class="tag-imported">✅ 已导入</span>` : "";
     html += `<label class="file-item${s.imported && !s.changed ? " imported" : ""}">
-      <input type="checkbox" class="fcb" data-f="${s.file.replace(/"/g, "&quot;")}" ${s.imported && !s.changed ? "" : "checked"}>
-      ${s.name} <span class="dim">· ${s.rounds} ${unit} · ${s.sizeKB}KB</span> ${modeTag} ${mark}</label>`;
+      <input type="checkbox" class="fcb" data-f="${esc(s.file)}" ${s.imported && !s.changed ? "" : "checked"}>
+      ${esc(s.name)} <span class="dim">· ${s.rounds} ${unit} · ${s.sizeKB}KB</span> ${modeTag} ${mark}</label>`;
   });
   html += `</div><button id="previewBtn" class="secondary">预览前 3 个文件</button> <button id="importBtn" class="primary">开始导入</button>`;
   $("scanResult").innerHTML = html;
@@ -513,6 +532,7 @@ async function startImportJob() {
 
 async function pollImport() {
   const s = await api("/api/import/status");
+  if (s.error) return; // 服务无响应：保留上次进度显示，等下一轮
   const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
   const fname = s.currentFile.split(/[\\/]/).pop() || "";
   const phaseTxt = s.phase === "waiting_llm" ? "等待模型提炼…" : "喂入中";
@@ -522,11 +542,11 @@ async function pollImport() {
     : "";
   if ($("barFill")) $("barFill").style.width = pct + "%";
   if ($("progressText")) $("progressText").innerHTML =
-    `文件 ${s.done}/${s.total}（${pct}%） · 当前：${fname} 第 ${s.currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
+    `文件 ${s.done}/${s.total}（${pct}%） · 当前：${esc(fname)} 第 ${s.currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
   if ($("toolBarFill")) $("toolBarFill").style.width = pct + "%";
   if ($("toolProgressText")) $("toolProgressText").innerHTML =
     `项目 ${s.done}/${s.total}（${pct}%） · 当前：${esc(fname)} 第 ${s.currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
-  if (!s.running) clearInterval(importTimer);
+  if (!s.running) { clearInterval(importTimer); clearInterval(toolImportTimer); importTimer = toolImportTimer = null; }
 }
 
 $("abortBtn").addEventListener("click", () => post("/api/import/abort"));
@@ -584,7 +604,7 @@ async function startToolImportJob() {
   const d = await post("/api/tool-import/start", { projects });
   if (!d.ok) { alert(d.error); return; }
   $("toolImportProgress").classList.remove("hidden");
-  importTimer = setInterval(pollImport, 2000);
+  toolImportTimer = setInterval(pollImport, 2000);
 }
 
 $("toolAbortBtn").addEventListener("click", () => post("/api/import/abort"));
@@ -613,16 +633,16 @@ async function loadL1(append) {
   if (q) p.set("q", q);
   if (type) p.set("type", type);
   const d = await api("/api/memories/l1?" + p);
-  if (d.error) { $("l1List").innerHTML = `<span class="bad">❌ ${d.error}</span>`; return; }
+  if (d.error) { $("l1List").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
   l1Total = d.data?.total ?? d.items?.length ?? 0;
   const items = d.data?.items ?? d.items ?? [];
   const html = items.map(m => `
     <label class="mem-item">
-      <input type="checkbox" class="micb" data-id="${m.id}">
+      <input type="checkbox" class="micb" data-id="${esc(m.id)}">
       <div class="mem-body">
         <div class="mem-head"><span class="tag">${m.type}</span><span class="dim">v${m.version} · ${fmtTime(m.updated_at)}</span><button class="mini edit-btn" data-id="${m.id}">编辑</button></div>
-        <div class="mem-text" id="mt-${m.id}">${(m.content || "").replace(/</g, "&lt;")}</div>
-        ${m.background ? `<div class="mem-bg">${m.background.replace(/</g, "&lt;")}</div>` : ""}
+        <div class="mem-text" id="mt-${m.id}">${esc(m.content)}</div>
+        ${m.background ? `<div class="mem-bg">${esc(m.background)}</div>` : ""}
       </div>
     </label>`).join("");
   $("l1List").innerHTML = append ? $("l1List").innerHTML + html : (html || "<p class='dim'>暂无记忆</p>");
@@ -675,13 +695,13 @@ $("l1Delete").addEventListener("click", async () => {
 $("l0Load").addEventListener("click", async () => {
   const q = $("l0Query").value.trim();
   const d = await api("/api/memories/l0?limit=10" + (q ? "&q=" + encodeURIComponent(q) : ""));
-  if (d.error) { $("l0List").innerHTML = `<span class="bad">❌ ${d.error}</span>`; return; }
+  if (d.error) { $("l0List").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
   const msgs = d.data?.messages ?? [];
   $("l0List").innerHTML = msgs.length ? msgs.map(m => `
     <div class="mem-item">
       <div class="mem-body">
         <div class="mem-head"><span class="tag">${m.role}</span><span class="dim">${m.score !== undefined ? "score " + m.score.toFixed(3) + " · " : ""}${fmtTime(m.timestamp || m.created_at)}</span></div>
-        <div class="mem-text">${(m.content || "").slice(0, 400).replace(/</g, "&lt;")}</div>
+        <div class="mem-text">${esc((m.content || "").slice(0, 400))}</div>
       </div>
     </div>`).join("") : "<p class='dim'>暂无对话流水</p>";
 });
@@ -689,13 +709,13 @@ $("l0Query").addEventListener("keydown", e => { if (e.key === "Enter") $("l0Load
 
 async function loadL2() {
   const d = await api("/api/memories/l2");
-  if (d.error) { $("l2List").innerHTML = `<span class="bad">❌ ${d.error}</span>`; return; }
+  if (d.error) { $("l2List").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
   const entries = d.data?.entries ?? [];
   $("l2List").innerHTML = entries.length ? entries.map(e => `
-    <div class="mem-item clickable" data-path="${(e.path || "").replace(/"/g, "&quot;")}">
+    <div class="mem-item clickable" data-path="${esc(e.path)}">
       <div class="mem-body">
         <div class="mem-head"><span class="tag">L2</span><span class="dim">${e.type || "file"}</span></div>
-        <div class="mem-text">${e.path || ""}</div>
+        <div class="mem-text">${esc(e.path)}</div>
       </div>
     </div>`).join("") : "<p class='dim'>暂无场景文件（L2 由内核在多轮提炼后自动生成）</p>";
   $("l2List").querySelectorAll(".clickable").forEach(el => el.addEventListener("click", async () => {
@@ -712,4 +732,4 @@ async function loadL3() {
 }
 
 init();
-setInterval(refresh, 10000);
+setInterval(() => { refresh().catch(() => {}); }, 10000);

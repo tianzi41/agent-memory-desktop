@@ -12,8 +12,12 @@ function Test-PortListening($p) {
 
 Write-Host "[AgentMemory watchdog] started (check every 30s, port $port)"
 
+$stoppedFlag = Join-Path $root ".stopped"
+
 while ($true) {
     Start-Sleep -Seconds 30
+    # 用户显式停过（stop.bat 写哨兵）：不拉活，直到下次真正启动（launcher 会删哨兵）
+    if (Test-Path $stoppedFlag) { continue }
     if (Test-PortListening $port) { continue }
 
     Write-Host "[AgentMemory watchdog] port $port down - relaunching..."

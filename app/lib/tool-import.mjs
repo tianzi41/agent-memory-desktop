@@ -197,15 +197,20 @@ async function describeProject(projectName, files, sourceType, keyPrefix) {
   };
 }
 
-// session_key 命名：<前缀><项目名>，总长控制在 60 字符内。
-// 超长名不能只截断——WorkBuddy 的 "...-Default-Workspace-2026-08-18-15-38-25" 一族
-// 只差尾巴的时间戳，截断后实测 120 个项目共用一个 key，对话会被混进同一记忆空间。
-// 因此截断后补一段完整名的短哈希，保证不同项目落到不同 session_key。
+// session_key 命名：<前缀><项目名>，总长控制在 60 字符内。两类歧义都必须兜住：
+// ① 超长名截断——WorkBuddy 的 "...-Default-Workspace-2026-08-18-15-38-25" 一族
+//    只差尾巴的时间戳，截断后实测 120 个项目共用一个 key；
+// ② sanitize 把非 ASCII 统一替换成 "_"——"我的项目/测试项目/临时项目" 全部塌缩成
+//    同一个 import-qw-____，比 ① 更隐蔽（名字很短，永远走不到截断分支）。
+// 因此只要 sanitize 改动过名字（或超长被截断）就补一段完整名的短哈希；
+// 纯 ASCII 且未改动的名字 key 保持不变（已导入标记不失效）。
 function makeSessionKey(keyPrefix, projectName) {
   const maxBase = 60 - keyPrefix.length;
-  const safe = projectName.replace(/\s+/g, "-").replace(/[^A-Za-z0-9_-]/g, "_");
-  if (safe.length <= maxBase) return keyPrefix + safe;
+  const spaced = projectName.replace(/\s+/g, "-");
+  const safe = spaced.replace(/[^A-Za-z0-9_-]/g, "_");
   const hash = createHash("sha1").update(projectName).digest("hex").slice(0, 6);
+  if (safe === spaced && safe.length <= maxBase) return keyPrefix + safe;
+  if (safe.length <= maxBase) return keyPrefix + safe + "-" + hash;
   return keyPrefix + safe.slice(0, maxBase - 7) + "-" + hash;
 }
 

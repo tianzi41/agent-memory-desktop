@@ -154,8 +154,11 @@ function nowLocalIso(): string {
 }
 
 function createConsoleLogger(): Logger {
+  // DEBUG 行会带用户对话原文（content=...），默认关闭——kernel.log 曾因此积到 37MB 明文。
+  // 需要排障时设环境变量 TDAI_LOG_DEBUG=1 打开。
+  const debugOn = process.env.TDAI_LOG_DEBUG === "1";
   return {
-    debug: (msg: string) => console.debug(`${nowLocalIso()} DEBUG ${TAG} ${msg}`),
+    debug: debugOn ? (msg: string) => console.debug(`${nowLocalIso()} DEBUG ${TAG} ${msg}`) : () => {},
     info: (msg: string) => console.info(`${nowLocalIso()} INFO  ${TAG} ${msg}`),
     warn: (msg: string) => console.warn(`${nowLocalIso()} WARN  ${TAG} ${msg}`),
     error: (msg: string) => console.error(`${nowLocalIso()} ERROR ${TAG} ${msg}`),
@@ -1548,9 +1551,12 @@ export class TdaiGateway {
       return;
     }
 
+    // limit 边界钳制：存储是同步 DatabaseSync，未校验的 limit（如 1e6）会冻结唯一
+    // 事件循环，健康检查/capture 全部 stall；与 index.ts 工具路径的钳制保持一致
+    const limit = Math.min(Math.max(Number(body.limit) || 5, 1), 20);
     const result = await this.core.searchMemories({
       query: body.query,
-      limit: body.limit,
+      limit,
       type: body.type,
       scene: body.scene,
     });
@@ -1571,9 +1577,11 @@ export class TdaiGateway {
       return;
     }
 
+    // 同上：conversations 检索的 limit 也要钳制（同步 SQL，负值=无限制全表）
+    const limit = Math.min(Math.max(Number(body.limit) || 5, 1), 20);
     const result = await this.core.searchConversations({
       query: body.query,
-      limit: body.limit,
+      limit,
       sessionKey: body.session_key,
     });
 
@@ -3252,6 +3260,16 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+  // Node 22 未处理拒绝默认终止进程；内核有大量 fire-and-forget 后台任务，
+  // 一个漏 catch 的 rejection 就会静默硬崩。记录并尽量保留进程。
+  process.on("unhandledRejection", (e) => {
+    console.error(`${nowLocalIso()} ERROR ${TAG} unhandledRejection:`, e instanceof Error ? e.stack || e.message : String(e));
+  });
+  process.on("uncaughtException", (e) => {
+    // 未捕获异常后进程状态不可信：记录后退出，由桌面端看门狗拉活
+    console.error(`${nowLocalIso()} ERROR ${TAG} uncaughtException:`, e instanceof Error ? e.stack || e.message : String(e));
+    process.exit(1);
+  });
 
   await gateway.start();
 }

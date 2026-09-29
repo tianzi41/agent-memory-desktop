@@ -307,7 +307,11 @@ export async function recordConversation(params: {
     logger?.debug?.(`${TAG} Recorded ${filtered.length} messages to ${recordKey}`);
   } catch (err) {
     logger?.error(`${TAG} Failed to write L0 file: ${err instanceof Error ? err.message : String(err)}`);
-    // Return filtered messages anyway so L1 can still process them
+    // 写盘失败时绝不能再把消息返回给调用方：auto-capture 会拿它们算 maxTimestamp 前移
+    // capture 游标，这批原始对话此后再不会被读取——永久丢失（磁盘满/权限异常/被杀并非
+    // 小概率）。返回空数组让游标停在原地，下一轮 capture 自然重试；L1 抽取有 enableDedup
+    // 兜底，重复抽取好过永久丢失。
+    return [];
   }
 
   return filtered;

@@ -31,10 +31,24 @@ function json(res, code, obj) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = "";
-    req.on("data", (c) => { data += c; if (data.length > 5 * 1024 * 1024) reject(new Error("body too large")); });
-    req.on("end", () => { try { resolve(data ? JSON.parse(data) : {}); } catch (e) { reject(e); } });
-    req.on("error", reject);
+    // Buffer 收集 + 一次性 concat 解码：不能 `data += c` 逐块转字符串——
+    // 多字节中文字符跨 TCP 段边界会被截断成 U+FFFD，且 JSON.parse 照样成功（静默数据损坏）
+    const chunks = [];
+    let size = 0;
+    let settled = false;
+    req.on("data", (c) => {
+      if (settled) return;
+      size += c.length;
+      if (size > 5 * 1024 * 1024) { settled = true; reject(new Error("body too large")); req.destroy(); return; }
+      chunks.push(c);
+    });
+    req.on("end", () => {
+      if (settled) return;
+      settled = true;
+      try { resolve(chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {}); }
+      catch (e) { reject(e); }
+    });
+    req.on("error", (e) => { if (!settled) { settled = true; reject(e); } });
   });
 }
 
@@ -124,6 +138,7 @@ const server = http.createServer(async (req, res) => {
         dataDir: cfg?.dataDir || defaultDataDir(),
         gateway: { healthy: h.ok, detail: h.body?.services ? { pipeline: h.body.services.pipelineWorker } : h.error },
         httpBridge: { running: httpBridgeRunning(), url: "http://127.0.0.1:8410/mcp" },
+        gatewayPort: cfg?.gatewayPort || 8420,
         kernelManaged: kernelRunning(),
       });
       return;
@@ -393,7 +408,7 @@ const server = http.createServer(async (req, res) => {
       json(res, 200, { ok: true });
       stopKernel();
       stopHttpBridge();
-      setTimeout(() => process.exit(0), 300);
+      setTimeout(() => process.exit(0), 300).unref();
       return;
     }
 
@@ -436,8 +451,22 @@ const server = http.createServer(async (req, res) => {
 
     json(res, 404, { ok: false, error: "unknown api" });
   } catch (e) {
-    json(res, 500, { ok: false, error: String(e.message || e) });
+    // 响应已开始写（头已发送）时再 writeHead 会抛 ERR_HTTP_HEADERS_SENT，
+    // 那个异常没人接会把整个 web 进程带走（Node 22 未处理拒绝即退出码 1）
+    if (!res.headersSent) json(res, 500, { ok: false, error: String(e.message || e) });
+    else { try { res.destroy(); } catch { /* 连接已断，无需补救 */ } }
   }
+});
+
+// Node 22 下未处理的 Promise rejection 默认终止进程：一个漏 await 的路由出错
+// 曾直接杀掉整个 web（内核子进程陪葬、在途导入/备份丢失）。这里兜底记录，保住进程。
+process.on("unhandledRejection", (e) => {
+  console.error("[unhandledRejection]", e instanceof Error ? e.stack || e.message : String(e));
+});
+process.on("uncaughtException", (e) => {
+  // 未捕获异常后进程状态不可信：记录后退出，交给 watchdog.ps1 拉活（好过带着坏状态继续跑）
+  console.error("[uncaughtException]", e instanceof Error ? e.stack || e.message : String(e));
+  process.exit(1);
 });
 
 // 今日统计采样：L0 总条数（v3 count）+ 内核 /health 的提炼计数器，交累加器算差量
@@ -500,12 +529,17 @@ server.listen(PORT, "127.0.0.1", () => {
   // watchdog/重启场景自愈：已完成配置但内核未运行时自动拉起
   // （内核是本进程的子进程，Web 被杀时内核会一起死，Web 复活后须重建）
   (async () => {
-    if (!loadAppConfig()) return; // 未完成向导不拉
-    const h = await health(3000).catch(() => ({ ok: false }));
-    if (!h.ok) {
-      console.log("[AgentMemory Desktop] kernel down, auto-starting...");
-      await startKernel();
-      console.log("[AgentMemory Desktop] kernel auto-start done");
+    try {
+      if (!loadAppConfig()) return; // 未完成向导不拉
+      const h = await health(3000).catch(() => ({ ok: false }));
+      if (!h.ok) {
+        console.log("[AgentMemory Desktop] kernel down, auto-starting...");
+        await startKernel();
+        console.log("[AgentMemory Desktop] kernel auto-start done");
+      }
+    } catch (e) {
+      // 自动拉起失败不能变成未处理拒绝把进程带走（watchdog 30s 后会再拉 web）
+      console.error("[AgentMemory Desktop] kernel auto-start failed: " + String(e.message || e));
     }
   })();
 });

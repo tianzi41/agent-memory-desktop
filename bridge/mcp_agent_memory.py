@@ -184,7 +184,12 @@ def agent_memory(
 
     capture 自动脱敏（密钥/令牌打码）。search 类每轮合计不超过 3 次，查不到就基于现有信息继续。
     """
-    _validate(mode, session_key, query, user_content, assistant_content)
+    # 校验失败也走统一错误信封：裸抛 ValueError 会变成 FastMCP 的 traceback 形状，
+    # 模型看到两种失败格式——正是 _envelope/_tool_error 要避免的
+    try:
+        _validate(mode, session_key, query, user_content, assistant_content)
+    except Exception as e:
+        return _tool_error(mode, e)
     if mode == "capture":
         return _capture(session_key, user_content, assistant_content)
     if mode == "recall":

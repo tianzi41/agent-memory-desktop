@@ -105,8 +105,10 @@ export class SerialQueue {
 
     this.debugFn?.(`[queue:${this.name}] dequeued, starting execution (remaining=${this.queue.length})`);
 
-    entry
-      .task()
+    // Promise.resolve().then(...) 把同步抛错转成 rejection：否则 running 永不复位，
+    // 后续 drain 全部短路、onIdle 永不 resolve——L1/L2 管线静默永久停摆
+    Promise.resolve()
+      .then(() => entry.task())
       .then((result) => entry.resolve(result))
       .catch((err) => entry.reject(err))
       .finally(() => {

@@ -2,7 +2,7 @@
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { loadAppConfig } from "./kernel.mjs";
-import { configDir } from "./config-gen.mjs";
+import { configDir, writeFileAtomic } from "./config-gen.mjs";
 import { parseFile, parseDocChunks, sanitizeContent } from "./md-parser.mjs";
 import { parseJsonlFile } from "./tool-import.mjs";
 
@@ -22,7 +22,9 @@ export function pruneImportedMap() {
   return removed;
 }
 function saveImportedMap(map) {
-  try { writeFileSync(IMPORTED_PATH, JSON.stringify(map, null, 2), "utf8"); } catch { /* 只影响标记，不影响导入 */ }
+  // 原子写：这个文件同时被导入任务与 /api/import/scan 的 pruneImportedMap 读-改-写，
+  // 中途崩溃留下截断 JSON 会让两边都解析失败
+  try { writeFileAtomic(IMPORTED_PATH, JSON.stringify(map, null, 2)); } catch { /* 只影响标记，不影响导入 */ }
 }
 
 // 导入任务状态（内存态，重启即失——重试清单同时落盘 data/config/import-log.json）

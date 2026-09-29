@@ -116,8 +116,12 @@ export interface StandaloneLLMConfig {
 // ============================
 
 function resolveSandboxedPath(workspaceDir: string, relativePath: string): string | null {
-  const resolved = path.resolve(workspaceDir, relativePath);
-  if (!resolved.startsWith(path.resolve(workspaceDir))) {
+  const root = path.resolve(workspaceDir);
+  const resolved = path.resolve(root, relativePath);
+  // 必须带尾分隔符：否则 <root>_evil/x.md 也 startsWith(<root>) 通过检查，
+  // LLM 一个 "../scene_blocks_evil/x.md" 就写出沙箱（与 local-backend.ts 的写法对齐）
+  const rootWithSep = root.endsWith(path.sep) ? root : root + path.sep;
+  if (resolved !== root && !resolved.startsWith(rootWithSep)) {
     return null;
   }
   return resolved;
