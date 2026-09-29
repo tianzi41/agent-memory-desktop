@@ -255,7 +255,7 @@ export async function startToolImport(projects) {
         const feed = [];
         let parseFail = 0;
         for (const f of proj.files) {
-          try { feed.push(...parseJsonlFile(f)); }
+          try { feed.push(...(await parseJsonlFile(f))); }
           catch { parseFail++; }
         }
         const total = feed.length;

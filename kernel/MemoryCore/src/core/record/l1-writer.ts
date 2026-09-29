@@ -150,6 +150,43 @@ export function generateMemoryId(): string {
 }
 
 /**
+ * 姓名别名兜底（提示词的代码级保障）。
+ *
+ * 提取提示词已要求"用户从未告知姓名时禁止输出任何括号别名"，但模型不完全听话——
+ * 实测同批 3 条里有 1 条仍输出「用户(tianzi)」。提示词是请求，这里是保证：
+ * 写入前把"可证明不是姓名"的别名剥掉，只留"用户"。
+ *
+ * 只剥两类可判定的（保守起见不扩大）：
+ *   1) 别名等于 session_key——tianzi 这类会话标识
+ *   2) 别名是正文里某条路径的目录片段——Q:/<工作目录>/... 被误当姓名
+ *      （边界认路径分隔符/连字符/下划线/点号，覆盖 Q:/a/b 与 Q--a 两种写法）
+ * 另剥占位符（"姓名"/"name" 等 LLM 忘填留下的空壳）。
+ *
+ * 注意：AI 凭空编造的中文名（如对话里 AI 自创的角色名）无法与真名按形态区分，
+ * 那一类仍靠提示词约束——本函数不碰，以免误删用户当真告知过的姓名。
+ */
+const NON_NAME_PLACEHOLDERS = new Set(["姓名", "名字", "name", "username", "用户"]);
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function stripNonNameAliases(content: string, sessionKey: string): string {
+  if (!content) return content;
+  return content.replace(/用户\s*[（(]([^）)]{1,15})[）)]/g, (whole, alias: string) => {
+    const a = alias.trim();
+    if (!a || NON_NAME_PLACEHOLDERS.has(a.toLowerCase())) return "用户";
+    if (sessionKey && a === sessionKey) return "用户";
+    const esc = escapeRegExp(a);
+    const asPathSegment = new RegExp(
+      `[\\\\/_.\\-]${esc}[\\\\/_.\\-]|[\\\\/_.\\-]${esc}$|^${esc}[\\\\/_.\\-]`
+    );
+    if (asPathSegment.test(content)) return "用户";
+    return whole;
+  });
+}
+
+/**
  * Write a memory record according to the dedup decision.
  *
  * - store: append new record
@@ -217,6 +254,10 @@ export async function writeMemory(params: {
     finalPriority = memory.priority;
     finalTimestamps = [now];
   }
+
+  // 姓名别名兜底：store / update / merge 三条路径的 content 都汇到 finalContent，
+  // 在这里统一剥一次"可证明不是姓名"的别名（详见 stripNonNameAliases 注释）
+  finalContent = stripNonNameAliases(finalContent, sessionKey);
 
   const record: MemoryRecord = {
     id: decision.record_id || generateMemoryId(),

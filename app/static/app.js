@@ -539,21 +539,20 @@ $("toolScanBtn").addEventListener("click", async () => {
   const box = $("toolScanResult");
   box.textContent = "扫描中（读取全部项目的消息数，可能需要几秒）…";
   const d = await api("/api/tool-import/scan");
-  if (d.workbuddy?.error || d.qwen?.error || d.claude?.error) {
-    box.innerHTML = (d.workbuddy?.error ? `<span class="bad">❌ WorkBuddy：${esc(d.workbuddy.error)}</span>` : "") +
-      (d.qwen?.error ? `<br><span class="bad">❌ Qwen：${esc(d.qwen.error)}</span>` : "") +
-      (d.claude?.error ? `<br><span class="bad">❌ Claude Code：${esc(d.claude.error)}</span>` : "");
+  const sources = d.sources || [];
+  // 有项目的来源才渲染分组；有 error/warning 的单独提示——"没找到"不能伪装成"没有数据"
+  const okSources = sources.filter((s) => (s.projects || []).length);
+  const problemSources = sources.filter((s) => s.error || s.warning);
+  if (!okSources.length) {
+    box.innerHTML = problemSources.length
+      ? problemSources.map((s) => `<div><span class="bad">⚠️ ${esc(s.label)}</span>：${esc(s.error || s.warning)}</div>`).join("")
+      : "未发现任何可导入的会话项目";
     return;
   }
-  const wb = d.workbuddy.projects || [];
-  const qw = d.qwen.projects || [];
-  const cc = d.claude.projects || [];
-  if (!wb.length && !qw.length && !cc.length) { box.innerHTML = "未发现 WorkBuddy / Qwen / Claude Code 项目"; return; }
-  const total = wb.length + qw.length + cc.length;
+  const total = okSources.reduce((n, s) => n + s.projects.length, 0);
   let html = `<label><input type="checkbox" id="toolSelAll"> 全选（${total} 个项目，已导入的默认不勾选）</label>`;
-  html += renderToolGroup("WorkBuddy", wb);
-  html += renderToolGroup("Qwen Workspace", qw);
-  html += renderToolGroup("Claude Code", cc);
+  for (const s of okSources) html += renderToolGroup(s.label, s.projects, s.root);
+  for (const s of problemSources) html += `<div class="dim tool-warn">⚠️ ${esc(s.label)}：${esc(s.error || s.warning)}</div>`;
   html += `<button id="toolImportBtn" class="primary">开始导入勾选项目</button>`;
   box.innerHTML = html;
   $("toolSelAll").addEventListener("change", () => {
@@ -562,9 +561,9 @@ $("toolScanBtn").addEventListener("click", async () => {
   $("toolImportBtn").addEventListener("click", startToolImportJob);
 });
 
-function renderToolGroup(title, projects) {
+function renderToolGroup(title, projects, root) {
   if (!projects.length) return "";
-  let html = `<div class="tool-group"><div class="tool-group-title">${title}（${projects.length} 个项目）</div><div class="file-list">`;
+  let html = `<div class="tool-group"><div class="tool-group-title">${title}（${projects.length} 个项目）${root ? ` <span class="dim">· ${esc(root)}</span>` : ""}</div><div class="file-list">`;
   for (const p of projects) {
     toolProjectMap[p.sessionKey] = p;
     const span = p.startTime && p.endTime ? ` ${fmtTime(p.startTime)} ~ ${fmtTime(p.endTime)}` : "";

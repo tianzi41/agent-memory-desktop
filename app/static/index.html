@@ -153,9 +153,9 @@
       </div>
       <div class="card wide">
         <h3>从 WorkBuddy / Qwen 导入</h3>
-        <p class="hint">自动扫描本机 WorkBuddy、千问工作区、Claude Code 的本地会话（JSONL），按项目合并后逐轮导入记忆。每个项目一个 session_key（import-wb- / import-qw- / import-cc- 前缀），已导入过的项目默认不勾选。</p>
+        <p class="hint">自动扫描本机各 Agent 的本地会话（JSONL），按项目合并后逐轮导入记忆。每个项目一个 session_key，已导入过的项目默认不勾选。若某工具把会话目录迁到了别处，可用环境变量指定：WORKBUDDY_HOME / QWENWORK_HOME / CLAUDE_CONFIG_DIR。</p>
         <div class="import-row">
-          <button id="toolScanBtn" class="secondary">扫描 WorkBuddy / Qwen / Claude Code 项目</button>
+          <button id="toolScanBtn" class="secondary">扫描本机 Agent 会话项目</button>
         </div>
         <div id="toolScanResult" class="scan-result"></div>
         <div id="toolImportProgress" class="import-progress hidden">

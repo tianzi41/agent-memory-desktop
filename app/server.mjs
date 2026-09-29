@@ -8,7 +8,7 @@ import { saveSetup, defaultDataDir, updateLlmConfig, getSessionKey, setSessionKe
 import { detectClients, injectClients, traeConfigText } from "./lib/inject.mjs";
 import { scanDir } from "./lib/md-parser.mjs";
 import { startImport, startToolImport, importStatus, abortImport, loadImportedMap, pruneImportedMap, previewImport } from "./lib/importer.mjs";
-import { scanWorkbuddyProjects, scanQwenProjects, scanClaudeProjects } from "./lib/tool-import.mjs";
+import { scanAllHarnesses } from "./lib/tool-import.mjs";
 import { autostartStatus, setAutostart, repairAutostartPath } from "./lib/autostart.mjs";
 import { exportBackup, importBackup } from "./lib/backup.mjs";
 import { uninstallPlan, runUninstall } from "./lib/uninstall.mjs";
@@ -293,14 +293,11 @@ const server = http.createServer(async (req, res) => {
 
     // ---- 从 WorkBuddy / Qwen Workspace 导入（JSONL 本地会话）----
     if (url.pathname === "/api/tool-import/scan" && req.method === "GET") {
-      const wb = scanWorkbuddyProjects();
-      const qw = scanQwenProjects();
-      const cc = scanClaudeProjects();
+      // 遍历注册表：新增客户端无需改这里（单一事实来源在 tool-import.mjs 的 HARNESSES）
+      const sources = await scanAllHarnesses();
       const imported = loadImportedMap();
-      for (const p of wb.projects) p.imported = !!imported[p.sessionKey];
-      for (const p of qw.projects) p.imported = !!imported[p.sessionKey];
-      for (const p of cc.projects) p.imported = !!imported[p.sessionKey];
-      json(res, 200, { workbuddy: wb, qwen: qw, claude: cc });
+      for (const s of sources) for (const p of s.projects) p.imported = !!imported[p.sessionKey];
+      json(res, 200, { sources });
       return;
     }
 

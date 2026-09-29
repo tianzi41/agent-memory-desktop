@@ -1,33 +1,81 @@
-// tool-import.mjs — 从 WorkBuddy / Qwen Workspace / Claude Code 的本地 JSONL 会话导入记忆
-// 仅做「扫描 + 解析为 feed」，实际 capture/等待提炼复用 importer.mjs 的 startToolImport
-import { readdirSync, readFileSync, statSync, existsSync } from "node:fs";
+// tool-import.mjs — 从各 Agent 的本地 JSONL 会话导入记忆
+//
+// 注册表模式：受支持的客户端集中在 HARNESSES 一条列表里（单一事实来源）。
+// 加新客户端只需往数组里加一条记录——server 路由、session_key 前缀、前端分组
+// 全部由它驱动，不存在"改了扫描忘了改 UI"这类静默漏改。
+//
+// 每个 root 都优先尊重工具自身的搬迁变量（deja-vu 同款思路）：用户把目录迁走后
+// 不会静默漏扫，而是能用环境变量指到新位置。根目录不存在时报 error；
+// 目录存在但一个项目都没扫到时报 warning——"没有数据"和"没找到"必须区分。
+import { readdir, readFile, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { createHash } from "node:crypto";
 import path from "node:path";
 import os from "node:os";
 import { sanitizeContent } from "./md-parser.mjs";
 
 const HOME = os.homedir();
-const WB_ROOT = path.join(HOME, ".workbuddy", "projects");
-const QW_ROOT = path.join(HOME, ".qwenworkcn", "projects");
-const CC_ROOT = path.join(HOME, ".claude", "projects");
+const envOr = (name, fallback) => (process.env[name] || "").trim() || fallback;
 
-// 收集某项目目录下所有 .jsonl 文件（递归；跳过 subagents / tool-results 子目录，
-// 那些是子代理/工具临时产物，不是用户与主助手的对话）
-function collectJsonl(dir) {
+// 收集会话时跳过的子目录：子代理内部流水与工具回填，不是用户与主助手的对话
+const SKIP_DIRS = new Set(["subagents", "tool-results", "compression-v2"]);
+
+/**
+ * 单一事实来源：每个受支持的客户端一条记录。
+ * @prop name      标识（进 API 响应，前端按它分组的 key）
+ * @prop label     UI 显示名
+ * @prop root      会话根目录（函数形式，求值时才读环境变量——便于测试与热更新）
+ * @prop keyPrefix 该项目导入后的 session_key 前缀（总长控制在 60 字符内）
+ */
+export const HARNESSES = [
+  {
+    name: "workbuddy",
+    label: "WorkBuddy",
+    root: () => envOr("WORKBUDDY_HOME", path.join(HOME, ".workbuddy", "projects")),
+    keyPrefix: "import-wb-",
+  },
+  {
+    name: "qwen",
+    label: "Qwen Workspace",
+    root: () => envOr("QWENWORK_HOME", path.join(HOME, ".qwenworkcn", "projects")),
+    keyPrefix: "import-qw-",
+  },
+  {
+    // CLAUDE_CONFIG_DIR 指向配置目录（默认 ~/.claude），会话在它下面的 projects/
+    name: "claude",
+    label: "Claude Code",
+    root: () => path.join(envOr("CLAUDE_CONFIG_DIR", path.join(HOME, ".claude")), "projects"),
+    keyPrefix: "import-cc-",
+  },
+];
+
+// 并发上限：项目级并行扫，但不开到几百个同时读——兼顾速度与文件句柄
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); }
+  }));
+  return out;
+}
+
+// 递归收集目录下所有 .jsonl（跳过 SKIP_DIRS）
+async function collectJsonl(dir) {
   const out = [];
-  const walk = (d) => {
+  const walk = async (d) => {
     let entries;
-    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    try { entries = await readdir(d, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
       const full = path.join(d, e.name);
       if (e.isDirectory()) {
-        if (e.name === "subagents" || e.name === "tool-results" || e.name === "compression-v2") continue;
-        walk(full);
+        if (SKIP_DIRS.has(e.name)) continue;
+        await walk(full);
       } else if (e.isFile() && e.name.endsWith(".jsonl")) {
         out.push(full);
       }
     }
   };
-  walk(dir);
+  await walk(dir);
   return out;
 }
 
@@ -43,7 +91,7 @@ function blocksToText(arr, types) {
     .trim();
 }
 
-// 本地命令元消息：/model 切换、命令回显、命令说明——客户端写给自己的，不是用户意图。
+// 本地命令元消息：/model 切换、命令回显、local-command-caveat——客户端写给自己的，不是用户意图。
 // 实测 Claude Code 一个项目 142 轮里有 30 轮是这类噪音（21%），不过滤会稀释记忆
 const META_PREFIX = /^\s*<(local-command-caveat|local-command-stdout|local-command-stderr|command-name|command-message|command-args)\b/;
 const META_WHOLE = /^\s*(\[Request interrupted by user\]|API Error|Caveat: The messages below)/;
@@ -77,10 +125,10 @@ function extractTurn(o) {
 }
 
 // 把一个 JSONL 文件解析成「顺序块」数组 [{role, text, ts}]
-function parseJsonlBlocks(file) {
+async function parseJsonlBlocks(file) {
   const blocks = [];
   let text;
-  try { text = readFileSync(file, "utf8"); } catch { return blocks; }
+  try { text = await readFile(file, "utf8"); } catch { return blocks; }
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let o;
@@ -114,17 +162,24 @@ function blocksToFeed(blocks) {
   return feed;
 }
 
-// 对外：解析单个 JSONL 文件为 feed（供预览/计数复用）
-export function parseJsonlFile(file) {
-  return blocksToFeed(parseJsonlBlocks(file));
+// 对外：解析单个 JSONL 文件为 feed（供导入管道复用）
+export async function parseJsonlFile(file) {
+  return blocksToFeed(await parseJsonlBlocks(file));
 }
 
 // 统计一个项目的元数据：会话数（jsonl 文件数）、消息数、时间跨度、总字节数
-function describeProject(projectName, files, sourceType) {
+async function describeProject(projectName, files, sourceType, keyPrefix) {
+  // 文件级并行读：一个项目通常几个到几十个文件，并行能明显缩短墙钟时间
+  const parts = await Promise.all(files.map(async (f) => {
+    let size = 0, blocks = [];
+    try { size = (await stat(f)).size; } catch {}
+    try { blocks = await parseJsonlBlocks(f); } catch {}
+    return { size, blocks };
+  }));
   let totalSize = 0, msgCount = 0, minTs = Infinity, maxTs = -Infinity;
-  for (const f of files) {
-    try { totalSize += statSync(f).size; } catch {}
-    for (const b of parseJsonlBlocks(f)) {
+  for (const { size, blocks } of parts) {
+    totalSize += size;
+    for (const b of blocks) {
       msgCount++;
       if (b.ts) { minTs = Math.min(minTs, b.ts); maxTs = Math.max(maxTs, b.ts); }
     }
@@ -138,48 +193,61 @@ function describeProject(projectName, files, sourceType) {
     sizeKB: Math.round(totalSize / 1024),
     startTime: isFinite(minTs) ? new Date(minTs).toISOString() : null,
     endTime: isFinite(maxTs) ? new Date(maxTs).toISOString() : null,
-    sessionKey: makeToolSessionKey(sourceType, projectName),
+    sessionKey: makeSessionKey(keyPrefix, projectName),
   };
 }
 
-// session_key 命名：import-wb- / import-qw- / import-cc- 前缀，总长度控制在 60 字符内
-function makeToolSessionKey(sourceType, projectName) {
-  const prefix = sourceType === "workbuddy" ? "import-wb-"
-    : sourceType === "qwen" ? "import-qw-"
-    : "import-cc-";
-  const maxBase = 60 - prefix.length;
+// session_key 命名：<前缀><项目名>，总长控制在 60 字符内。
+// 超长名不能只截断——WorkBuddy 的 "...-Default-Workspace-2026-08-18-15-38-25" 一族
+// 只差尾巴的时间戳，截断后实测 120 个项目共用一个 key，对话会被混进同一记忆空间。
+// 因此截断后补一段完整名的短哈希，保证不同项目落到不同 session_key。
+function makeSessionKey(keyPrefix, projectName) {
+  const maxBase = 60 - keyPrefix.length;
   const safe = projectName.replace(/\s+/g, "-").replace(/[^A-Za-z0-9_-]/g, "_");
-  return prefix + safe.slice(0, maxBase);
+  if (safe.length <= maxBase) return keyPrefix + safe;
+  const hash = createHash("sha1").update(projectName).digest("hex").slice(0, 6);
+  return keyPrefix + safe.slice(0, maxBase - 7) + "-" + hash;
 }
 
-// 扫描 WorkBuddy 全部项目
-export function scanWorkbuddyProjects() {
-  return scanSource(WB_ROOT, "workbuddy");
+/**
+ * 扫描全部已注册客户端——前端与导入管道的唯一入口。
+ * 每个来源返回 {source, label, root, error|warning, projects, total}：
+ *   error   根目录不存在（工具没装 / 被卸载）
+ *   warning 目录在但没扫到任何项目（工具改版迁走了目录？用环境变量指一下）
+ * 两者都算"明确告知"，不让调用方把"没找到"误读成"没有数据"。
+ */
+export async function scanAllHarnesses() {
+  return Promise.all(HARNESSES.map(async (h) => {
+    const root = h.root();
+    try {
+      const r = await scanSource(root, h.name, h.keyPrefix);
+      return { source: h.name, label: h.label, root, ...r };
+    } catch (e) {
+      return { source: h.name, label: h.label, root, error: "扫描异常：" + String(e.message || e), projects: [], total: 0 };
+    }
+  }));
 }
 
-// 扫描 Qwen Workspace 全部项目
-export function scanQwenProjects() {
-  return scanSource(QW_ROOT, "qwen");
-}
-
-// 扫描 Claude Code 全部项目（~/.claude/projects/<项目名>/<uuid>.jsonl）
-export function scanClaudeProjects() {
-  return scanSource(CC_ROOT, "claude");
-}
-
-function scanSource(root, sourceType) {
-  if (!existsSync(root)) return { source: sourceType, root, error: "目录不存在：" + root, projects: [] };
-  const projects = [];
+async function scanSource(root, sourceType, keyPrefix) {
+  if (!existsSync(root)) {
+    return { source: sourceType, root, error: `目录不存在：${root}`, projects: [], total: 0 };
+  }
   let entries;
-  try { entries = readdirSync(root, { withFileTypes: true }); } catch (e) {
-    return { source: sourceType, root, error: "读取失败：" + e.message, projects: [] };
-  }
-  for (const e of entries) {
-    if (!e.isDirectory()) continue;
-    const files = collectJsonl(path.join(root, e.name));
-    if (!files.length) continue;
-    projects.push(describeProject(e.name, files, sourceType));
-  }
-  projects.sort((a, b) => b.msgCount - a.msgCount);
-  return { source: sourceType, root, projects, total: projects.length };
+  try { entries = await readdir(root, { withFileTypes: true }); }
+  catch (e) { return { source: sourceType, root, error: "读取失败：" + e.message, projects: [], total: 0 }; }
+
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name);
+  const projects = (await mapLimit(dirs, 8, async (name) => {
+    const files = await collectJsonl(path.join(root, name));
+    if (!files.length) return null;
+    return describeProject(name, files, sourceType, keyPrefix);
+  })).filter(Boolean);
+
+  projects.sort((a, b) => b.msgCount - a.msgCount); // 大项目在前方便用户决策
+
+  // 目录存在却零项目：更可能是"没找到"而不是"没有"——给 warning 而非静默空列表
+  const warning = projects.length === 0
+    ? `目录存在但未发现任何会话：${root}（若该工具改版迁走了目录，可用环境变量指定新路径）`
+    : null;
+  return { source: sourceType, root, projects, total: projects.length, warning };
 }
