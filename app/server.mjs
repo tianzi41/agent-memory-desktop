@@ -134,13 +134,22 @@ const server = http.createServer(async (req, res) => {
         setupDone: !!cfg,
         model: cfg?.model, baseUrl: cfg?.baseUrl,
         apiKeyMasked: cfg?.apiKey ? cfg.apiKey.slice(0, 6) + "..." : null,
-        apiKey: cfg?.apiKey || null, // 仅本机 127.0.0.1 监听，修改配置表单预填用
+        // 完整 key 不再随 /api/status 返回（任何能访问 8430 的脚本都能顺手牵羊），
+        // 改由 /api/config/secret 在编辑表单打开的瞬间按需取
         dataDir: cfg?.dataDir || defaultDataDir(),
         gateway: { healthy: h.ok, detail: h.body?.services ? { pipeline: h.body.services.pipelineWorker } : h.error },
         httpBridge: { running: httpBridgeRunning(), url: "http://127.0.0.1:8410/mcp" },
         gatewayPort: cfg?.gatewayPort || 8420,
         kernelManaged: kernelRunning(),
       });
+      return;
+    }
+
+    // 完整 LLM Key 专用端点：仅"打开编辑配置表单"时调一次。
+    // 仍只绑 127.0.0.1 且过 Origin 白名单，但不再塞进高频轮询的 /api/status。
+    if (url.pathname === "/api/config/secret" && req.method === "GET") {
+      const cfg = loadAppConfig();
+      json(res, 200, { apiKey: cfg?.apiKey || null });
       return;
     }
 

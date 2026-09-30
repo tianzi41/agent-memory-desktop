@@ -17,7 +17,7 @@
  */
 
 import { CleanContextRunner } from "../../utils/clean-context-runner.js";
-import { CheckpointManager } from "../../utils/checkpoint.js";
+import { CheckpointManager, withFileLock } from "../../utils/checkpoint.js";
 import { BackupManager } from "../../utils/backup.js";
 import { readSceneIndex, syncSceneIndex } from "../scene/scene-index.js";
 import type { SceneIndexEntry } from "../scene/scene-index.js";
@@ -135,10 +135,22 @@ export class SceneExtractor {
   /**
    * Extract a batch of memories into scene blocks using the LLM agent.
    *
-   * @param memories - Array of raw memory records from the API
-   * @returns Extraction result with count and success flag
+   * 全局锁：scene_blocks/ 是实例级共享资源，而 L2 的"已入队"守卫是 session 级的——
+   * 两个 session 并发抽取会都备份同一目录、都让 LLM 写入，任一失败的 rm -rf
+   * 回滚会干掉对方已提交的场景（K-CRIT-02）。用场景目录本身作为锁键把整个
+   * extract 串行化；单进程部署下足够，跨节点由存储后端负责。
    */
   async extract(memories: Array<{ content: string; created_at: string; id?: string }>): Promise<ExtractionResult> {
+    const lockKey = this.storage
+      ? StoragePaths.sceneBlocksDir
+      : (await import("node:path")).default.join(this.dataDir, "scene_blocks");
+    return withFileLock(lockKey, () => this.extractLocked(memories));
+  }
+
+  /**
+   * 真正的抽取流程（由 extract 持有全局锁后调用，勿直接调用）。
+   */
+  async extractLocked(memories: Array<{ content: string; created_at: string; id?: string }>): Promise<ExtractionResult> {
     const extractStartMs = Date.now();
     this.logger?.info(`${TAG} extract() start: ${memories.length} memories`);
 
@@ -169,10 +181,12 @@ export class SceneExtractor {
     // responsibility, so `bm` stays undefined and the catch-block restore
     // below short-circuits to a no-op.
     let bm: BackupManager | undefined;
+    let snapshotPath: string | undefined;
     if (!this.storage) {
       const path = await import("node:path");
       bm = new BackupManager(path.default.join(this.dataDir, ".backup"));
-      await bm.backupDirectory(sceneBlocksDir, "scene_blocks", `offset${cp.total_processed}`, this.sceneBackupCount);
+      snapshotPath = await bm.backupDirectory(sceneBlocksDir, "scene_blocks", `offset${cp.total_processed}`, this.sceneBackupCount);
+      if (snapshotPath) this.logger?.debug?.(`${TAG} extract() scene_blocks snapshot: ${snapshotPath}`);
     }
     this.logger?.debug?.(`${TAG} extract() backup phase: ${Date.now() - backupStartMs}ms`);
 
@@ -278,13 +292,12 @@ export class SceneExtractor {
       // In service mode (`this.storage` set) we never took a local backup,
       // so `bm` is undefined and we skip restore — the storage backend
       // owns its own snapshot/restore semantics.
-      if (bm) {
+      if (bm && snapshotPath) {
         try {
-          const result = await bm.restoreLatestDirectory("scene_blocks", sceneBlocksDir);
+          // 恢复"本次这一份"快照，而不是跨所有运行字典序最新的那份
+          const result = await bm.restoreFrom(snapshotPath, sceneBlocksDir);
           if (result.restored) {
-            this.logger?.warn(`${TAG} extract() restored scene_blocks/ from backup: ${result.from}`);
-          } else {
-            this.logger?.debug?.(`${TAG} extract() no scene_blocks backup to restore from (first run or empty)`);
+            this.logger?.warn(`${TAG} extract() restored scene_blocks/ from own snapshot: ${result.from}`);
           }
         } catch (restoreErr) {
           const rMsg = restoreErr instanceof Error ? restoreErr.message : String(restoreErr);

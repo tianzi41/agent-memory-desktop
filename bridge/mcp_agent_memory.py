@@ -43,8 +43,11 @@ class _DeclaredOnlyFastMCP(FastMCP):
 
 mcp = _DeclaredOnlyFastMCP("agent-memory")
 
-# 入库前脱敏：与 Web 导入侧保持一致（只拦确定性命中率高的形态，
-# 不做 hex/base64 弱匹配——对话里 URL/hash 多，误伤比漏拦更糟）
+# 入库前脱敏：与 Web 导入侧（md-parser.mjs）完全对齐——5 强 + 2 弱。
+# 弱特征（长 hex / 长 base64）单独出现多为 git hash、URL 路径、data URI，
+# 只有 60 字符窗口内出现密钥上下文词才打码（避免误伤代码与路径）。
+# 曾只有 5 强：同一凭据走 MD 导入被掩、走 MCP capture 明文入库——存储的
+# 保证取决于走哪扇门，这是审计点名的 B-HIGH-02。
 _REDACT_PATTERNS = [
     re.compile(r"\bsk-[A-Za-z0-9_-]{16,}\b"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}\b"),
@@ -52,6 +55,14 @@ _REDACT_PATTERNS = [
     re.compile(r"\bxox[bpars]-[A-Za-z0-9-]{10,}\b"),
     re.compile(r"\b(?:api[_-]?key|apikey|token|secret|passwd|password|pwd)\s*[:=]\s*[\"']?([A-Za-z0-9_\-]{16,})[\"']?", re.I),
 ]
+_WEAK_PATTERNS = [
+    re.compile(r"\b[A-Fa-f0-9]{32,}\b"),          # 长 hex（md5/sha/密钥）
+    re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),   # 长 base64 串
+]
+_KEY_CONTEXT = re.compile(
+    r"(api[_-]?key|apikey|token|secret|passwd|password|pwd|signature|sig|md5|sha\d*|密钥|秘钥|签名|credential|hash)",
+    re.I,
+)
 
 
 def _redact(text: str) -> str:
@@ -64,6 +75,11 @@ def _redact(text: str) -> str:
 
     for pattern in _REDACT_PATTERNS:
         text = pattern.sub(_mask, text)
+    for pattern in _WEAK_PATTERNS:
+        def _weak(m):
+            ctx = text[max(0, m.start() - 60):m.start()] + text[m.end():m.end() + 60]
+            return _mask(m) if _KEY_CONTEXT.search(ctx) else m.group(0)
+        text = pattern.sub(_weak, text)
     return text
 
 

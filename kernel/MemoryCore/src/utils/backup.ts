@@ -74,17 +74,17 @@ export class BackupManager {
     category: string,
     tag: string,
     maxKeep: number,
-  ): Promise<void> {
+  ): Promise<string | undefined> {
     let entries: import("node:fs").Dirent[];
     try {
       entries = await fs.readdir(srcDir, { withFileTypes: true });
     } catch {
-      return; // Source directory doesn't exist
+      return undefined; // Source directory doesn't exist
     }
 
     // Only backup regular files (skip subdirectories to avoid EISDIR errors)
     const files = entries.filter((e) => e.isFile()).map((e) => e.name);
-    if (files.length === 0) return;
+    if (files.length === 0) return undefined;
 
     const parentDir = path.join(this.backupRoot, category);
     const timestamp = formatTimestamp(new Date());
@@ -98,6 +98,9 @@ export class BackupManager {
     if (maxKeep > 0) {
       await pruneOldEntries(parentDir, maxKeep, "directory");
     }
+    // 返回本次快照路径：调用方回滚时必须恢复"自己这一份"，
+    // 而不是 findLatestBackup 挑到的、可能属于别的运行/更旧代的那份
+    return destDir;
   }
 
   /**
@@ -147,19 +150,36 @@ export class BackupManager {
   ): Promise<{ restored: boolean; from?: string }> {
     const from = await this.findLatestBackup(category);
     if (!from) return { restored: false };
+    return this.restoreFrom(from, destDir);
+  }
 
+  /**
+   * Restore a SPECIFIC backup directory into `destDir`.
+   *
+   * 与 restoreLatestDirectory 的区别：恢复的是调用方指定的那一份。
+   * L2 extract 失败回滚曾用 restoreLatestDirectory——它取"跨所有运行的字典序
+   * 最新备份"，可能是别的运行甚至更旧代留下的，把好数据回滚坏（K-CRIT-02）。
+   * 自己备份的调用方应该拿 backupDirectory 的返回值走这里。
+   *
+   * @param backupDir - Absolute path to a specific backup directory
+   * @param destDir   - Absolute path to the directory to restore into
+   */
+  async restoreFrom(
+    backupDir: string,
+    destDir: string,
+  ): Promise<{ restored: boolean; from?: string }> {
     // Wipe the destination first so any partial LLM writes are removed,
     // then recreate the directory and copy regular files back.
     await fs.rm(destDir, { recursive: true, force: true });
     await fs.mkdir(destDir, { recursive: true });
 
-    const entries = await fs.readdir(from, { withFileTypes: true });
+    const entries = await fs.readdir(backupDir, { withFileTypes: true });
     for (const entry of entries) {
       if (!entry.isFile()) continue;
-      await fs.copyFile(path.join(from, entry.name), path.join(destDir, entry.name));
+      await fs.copyFile(path.join(backupDir, entry.name), path.join(destDir, entry.name));
     }
 
-    return { restored: true, from };
+    return { restored: true, from: backupDir };
   }
 }
 

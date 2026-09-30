@@ -30,6 +30,8 @@ function asSceneIndexDerivable(storage: StorageAdapter | undefined): SceneIndexD
 
 // ── fs fallback helpers (used when no StorageAdapter is provided) ──
 
+import { writeFileAtomic } from "../../utils/atomic-write.js";
+
 async function fsReadFile(absPath: string): Promise<string | null> {
   const fs = await import("node:fs/promises");
   try {
@@ -38,10 +40,8 @@ async function fsReadFile(absPath: string): Promise<string | null> {
 }
 
 async function fsWriteFile(absPath: string, content: string): Promise<void> {
-  const fs = await import("node:fs/promises");
-  const path = await import("node:path");
-  await fs.default.mkdir(path.default.dirname(absPath), { recursive: true });
-  await fs.default.writeFile(absPath, content, "utf-8");
+  // 原子写：scene_index.json 被读成"零场景"比写慢一点糟糕得多（K-HIGH-05）
+  await writeFileAtomic(absPath, content);
 }
 
 async function fsReaddir(absDir: string, suffix: string): Promise<string[]> {
@@ -91,7 +91,10 @@ export async function readSceneIndex(dataDir: string, storage?: StorageAdapter):
       });
     }
     return entries;
-  } catch {
+  } catch (e) {
+    // 读不出索引不能静默返回 []：persona 生成/recall 会基于"零场景"的假前提继续，
+    // 且无任何痕迹。先保证"坏了能知道"（彻底修法是 Result 类型，见审计 K-HIGH-06）。
+    console.warn(`[scene-index] readSceneIndex failed, returning empty: ${e instanceof Error ? e.message : String(e)}`);
     return [];
   }
 }
@@ -128,8 +131,8 @@ export async function syncSceneIndex(dataDir: string, storage?: StorageAdapter):
     files = await fsReaddir(path.default.join(dataDir, "scene_blocks"), ".md");
   }
 
-  const entries: SceneIndexEntry[] = [];
-  for (const file of files) {
+  // 并发解析：串行 await 每个 scene，maxScenes 提升后非线性变慢（K-HIGH-17）
+  const parsed = await Promise.all(files.map(async (file) => {
     try {
       let raw: string | null;
       if (storage) {
@@ -138,19 +141,22 @@ export async function syncSceneIndex(dataDir: string, storage?: StorageAdapter):
         const path = await import("node:path");
         raw = await fsReadFile(path.default.join(dataDir, "scene_blocks", file));
       }
-      if (!raw) continue;
+      if (!raw) return null;
       const block = parseSceneBlock(raw, file);
-      entries.push({
+      return {
         filename: file,
         summary: block.meta.summary,
         heat: block.meta.heat,
         created: block.meta.created,
         updated: block.meta.updated,
-      });
-    } catch {
-      continue;
+      };
+    } catch (e) {
+      // 单个 scene 解析失败不拖垮整体同步，但留痕——否则"场景莫名少了"无迹可查
+      console.warn(`[scene-index] syncSceneIndex skipped ${file}: ${e instanceof Error ? e.message : String(e)}`);
+      return null;
     }
-  }
+  }));
+  const entries = parsed.filter((e): e is SceneIndexEntry => e !== null);
 
   await writeSceneIndex(dataDir, entries, storage);
   return entries;

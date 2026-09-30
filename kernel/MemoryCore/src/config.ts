@@ -583,7 +583,12 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
       promptMode: normalizePromptMode(str(personaGroup, "promptMode"), globalPromptMode),
     },
     pipeline: {
-      everyNConversations: num(pipelineGroup, "everyNConversations") ?? 5,
+      // everyNConversations <= 0 会让下游取模算出 NaN——提炼触发器静默失效，
+      // 且 YAML 里写 0 不报错。钳到 >= 1（审计点名的配置校验缺口）。
+      everyNConversations: (() => {
+        const n = num(pipelineGroup, "everyNConversations");
+        return n != null && n >= 1 ? Math.floor(n) : 5;
+      })(),
       enableWarmup: bool(pipelineGroup, "enableWarmup") ?? true,
       l1IdleTimeoutSeconds: num(pipelineGroup, "l1IdleTimeoutSeconds") ?? 600,
       l2DelayAfterL1Seconds: num(pipelineGroup, "l2DelayAfterL1Seconds") ?? 10,

@@ -22,6 +22,7 @@ import type { EmbeddingService } from "../core/store/embedding.js";
 import { createScopedStorageAdapter, scopeProfileStorageView, type StorageAdapter } from "../core/storage/adapter.js";
 import { StoragePaths } from "../core/storage/types.js";
 import type { Logger } from "../core/types.js";
+import { formatLocalDate as formatLocalDateForJsonl } from "../utils/local-date.js";
 import type { IStateBackend } from "../core/state/types.js";
 import type { PipelineWorker } from "../services/pipeline-worker.js";
 import { executeMemorySearch } from "../core/tools/memory-search.js";
@@ -2257,18 +2258,6 @@ async function handlePipelineStatus(
 // ============================
 // Helpers
 // ============================
-
-/**
- * Format a Date as YYYY-MM-DD in local timezone, matching the convention used by
- * v1 l0-recorder and l1-writer for daily JSONL shard names. Local copy to keep
- * v2-router self-contained (avoids exporting a util just for one call site).
- */
-function formatLocalDateForJsonl(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}
 
 // ============================
 // Exported for testing

@@ -21,6 +21,7 @@ import path from "node:path";
 import { generateText, streamText, tool, stepCountIs, jsonSchema } from "ai";
 import { createOpenAI } from "@ai-sdk/openai";
 import { report } from "../../core/report/reporter.js";
+import { writeFileAtomic } from "../../utils/atomic-write.js";
 import type {
   LLMRunner,
   LLMRunParams,
@@ -172,7 +173,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
         if (!resolved) return JSON.stringify({ error: `Path "${args.path}" escapes workspace boundary.` });
         try {
           await fsPromises.mkdir(path.dirname(resolved), { recursive: true });
-          await fsPromises.writeFile(resolved, args.content, "utf-8");
+          await writeFileAtomic(resolved, args.content);
           logger?.debug?.(`${TAG} write: "${args.path}" → ${Buffer.byteLength(args.content, "utf8")} bytes`);
           return JSON.stringify({ success: true });
         } catch (err) {
@@ -221,7 +222,7 @@ function createSandboxedTools(workspaceDir: string, logger?: Logger) {
             // of the file on every edit, growing scene blocks exponentially.
             content = content.replace(edit.oldText, () => edit.newText);
           }
-          await fsPromises.writeFile(resolved, content, "utf-8");
+          await writeFileAtomic(resolved, content);
           logger?.debug?.(
             `${TAG} edit: "${args.path}" → ${args.edits.length} replacement(s), ${Buffer.byteLength(content, "utf8")} bytes`,
           );

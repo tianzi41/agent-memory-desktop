@@ -362,8 +362,9 @@ $("editCfgBtn").addEventListener("click", async () => {
   const form = $("cfgForm");
   if (form.classList.contains("hidden")) {
     const s = await api("/api/status");
+    const sec = await api("/api/config/secret"); // 完整 key 按需取，不再随 status 常驻
     $("editBaseUrl").value = s.baseUrl || "";
-    $("editApiKey").value = s.apiKey || "";
+    $("editApiKey").value = sec.apiKey || "";
     $("editModel").value = s.model || "";
     form.classList.remove("hidden");
   } else {

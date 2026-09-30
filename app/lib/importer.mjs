@@ -22,9 +22,13 @@ export function pruneImportedMap() {
   return removed;
 }
 function saveImportedMap(map) {
-  // 原子写：这个文件同时被导入任务与 /api/import/scan 的 pruneImportedMap 读-改-写，
-  // 中途崩溃留下截断 JSON 会让两边都解析失败
-  try { writeFileAtomic(IMPORTED_PATH, JSON.stringify(map, null, 2)); } catch { /* 只影响标记，不影响导入 */ }
+  // 原子写 + 合并：导入任务持有的是任务开始时的快照，同期 /api/import/scan 的
+  // pruneImportedMap 可能已增删条目——整体覆盖会静默丢对方的修改（去重标记失真）。
+  // 每次保存前重读磁盘：磁盘上我们不认识的条目保留，本任务的标记优先。
+  try {
+    const merged = { ...loadImportedMap(), ...map };
+    writeFileAtomic(IMPORTED_PATH, JSON.stringify(merged, null, 2));
+  } catch { /* 只影响标记，不影响导入 */ }
 }
 
 // 导入任务状态（内存态，重启即失——重试清单同时落盘 data/config/import-log.json）
@@ -59,7 +63,12 @@ async function gwCaptureOnce(sessionKey, user, assistant) {
     body: JSON.stringify({ session_key: sessionKey, user_content: user, assistant_content: assistant }),
     signal: AbortSignal.timeout(30000),
   });
-  return r.ok ? true : r.status;
+  const ok = r.ok;
+  const status = r.status;
+  // 读走/取消响应体再返回：undici 会持有底层 socket 直到 body 被消费，
+  // 长驻导入进程里每轮都漏就是慢泄漏
+  await r.body?.cancel().catch(() => {});
+  return ok ? true : status;
 }
 
 // 带重试的 capture：网络/超时类失败等 20s 重试（最多 4 次）；400 是确定性失败不重试
@@ -69,7 +78,8 @@ async function gwCapture(sessionKey, user, assistant) {
     try { res = await gwCaptureOnce(sessionKey, user, assistant); } catch { res = false; }
     if (res === true) return true;
     if (res === 400) return false;
-    await sleep(20000);
+    // 最后一次失败不再干等 20s——调用方紧接着就要记失败，白等纯浪费
+    if (attempt < 4) await sleep(20000);
   }
   return false;
 }

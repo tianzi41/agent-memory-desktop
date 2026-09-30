@@ -18,6 +18,7 @@ import type {
   StorageLogger,
 } from "./types.js";
 import { pageEntries } from "./list-page.js";
+import { writeFileAtomic } from "../../utils/atomic-write.js";
 
 const TAG = "[storage][local]";
 
@@ -93,12 +94,13 @@ export class LocalStorageBackend implements IStorageBackend {
     await mkdir(dirname(filePath), { recursive: true });
 
     const buf = typeof content === "string" ? Buffer.from(content, "utf-8") : content;
-    await writeFile(filePath, buf);
+    // 原子写：截断半条的 scene .md / 元数据比慢一点糟糕得多（K-HIGH-05）
+    await writeFileAtomic(filePath, buf);
 
     // Store metadata as a sidecar .meta.json file if metadata is provided
     if (opts?.contentType || (opts?.metadata && Object.keys(opts.metadata).length > 0)) {
       const metaPath = filePath + ".meta.json";
-      await writeFile(metaPath, JSON.stringify({
+      await writeFileAtomic(metaPath, JSON.stringify({
         contentType: opts.contentType,
         metadata: opts.metadata,
       }));

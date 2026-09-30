@@ -28,6 +28,16 @@ const L1_DIR_NAME = "records";
 const MIN_RETAIN_L0 = 50;
 const MIN_RETAIN_L1 = 20;
 
+/**
+ * 单轮文件删除比例上限：一轮要删的分片超过 80% 且样本量足够时，整轮拒绝。
+ * 防的是时钟向前跳变（笔记本唤醒 / NTP / RTC 校正）——cutoff 合法地大幅前移，
+ * 按文件名删会一次性删掉几乎全部历史对话且不可逆。sqlite 侧早有同款守卫，
+ * 文件侧对齐（审计 K-HIGH-15）。
+ */
+const MAX_DELETE_RATIO = 0.8;
+/** 比例守卫的最小样本量：分片太少时不做比例判断（正常小库） */
+const MIN_SCANNED_FOR_GUARD = 10;
+
 export class LocalMemoryCleaner {
   private readonly timer: ManagedTimer;
   private destroyed = false;
@@ -241,6 +251,9 @@ export class LocalMemoryCleaner {
       return stats;
     }
 
+    // 第一遍：只筛选不删除。先算出"这轮要删多少"，守卫放行了才动手——
+    // 边遍历边删就没法在造成不可逆后果前踩刹了。
+    const expired: string[] = [];
     for (const entry of entries) {
       if (!entry.isFile()) continue;
       if (!isJsonLikeFile(entry.name)) continue;
@@ -258,6 +271,25 @@ export class LocalMemoryCleaner {
 
       const dayEndMs = localDayEndMs(shard.year, shard.month, shard.day);
       if (dayEndMs < cutoffMs) {
+        expired.push(filePath);
+      } else {
+        this.opts.logger?.debug?.(`${TAG} Keep shard file by name: ${filePath}`);
+      }
+    }
+
+    if (expired.length > 0) {
+      const ratio = expired.length / stats.scannedFiles;
+      if (ratio > MAX_DELETE_RATIO && stats.scannedFiles >= MIN_SCANNED_FOR_GUARD) {
+        // 两种成因：系统时钟被向前调（cutoff 合法前移）或 retentionDays 被误配。
+        // 宁可漏清也不误删——真要强制清理，先手工归档再把比例调宽松。
+        this.opts.logger?.error(
+          `${TAG} REFUSED mass delete: ${expired.length}/${stats.scannedFiles} shards expired ` +
+          `(${(ratio * 100).toFixed(0)}% > ${(MAX_DELETE_RATIO * 100).toFixed(0)}%) in ${dirPath}. ` +
+          `Possible forward clock jump or bad retentionDays. No file was deleted this run.`,
+        );
+        return stats;
+      }
+      for (const filePath of expired) {
         try {
           await fs.unlink(filePath);
           stats.changedFiles += 1;
@@ -268,8 +300,6 @@ export class LocalMemoryCleaner {
             `${TAG} Failed to delete expired shard file ${filePath}: ${err instanceof Error ? err.message : String(err)}`,
           );
         }
-      } else {
-        this.opts.logger?.debug?.(`${TAG} Keep shard file by name: ${filePath}`);
       }
     }
 

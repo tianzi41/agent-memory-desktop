@@ -158,13 +158,18 @@ const fileLocks = new Map<string, Promise<void>>();
 /**
  * Serialize async critical sections per file path.
  * Under no contention the overhead is a single resolved-promise await.
+ *
+ * 导出供非 checkpoint 的临界区使用（如 L2 scene_blocks 全局锁，见 scene-extractor）。
  */
-async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+export async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<T> {
+  // 锁键必须先 resolve：Windows 下 Q:\data\x.json（path.join 产物）与 Q:/data/x.json
+  // （YAML/env 产物）不归一会哈希到不同键——两个 CheckpointManager 零互斥、静默丢游标。
+  const key = (await import("node:path")).default.resolve(filePath);
   // Chain after whatever is currently queued for this path
-  const prev = fileLocks.get(filePath) ?? Promise.resolve();
+  const prev = fileLocks.get(key) ?? Promise.resolve();
   let release!: () => void;
   const gate = new Promise<void>((r) => { release = r; });
-  fileLocks.set(filePath, gate);
+  fileLocks.set(key, gate);
 
   await prev;
   try {
@@ -172,8 +177,8 @@ async function withFileLock<T>(filePath: string, fn: () => Promise<T>): Promise<
   } finally {
     release();
     // Clean up the map entry if we're the tail of the chain
-    if (fileLocks.get(filePath) === gate) {
-      fileLocks.delete(filePath);
+    if (fileLocks.get(key) === gate) {
+      fileLocks.delete(key);
     }
   }
 }

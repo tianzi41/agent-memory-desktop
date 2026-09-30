@@ -20,6 +20,7 @@ import type { StorageAdapter } from "../storage/adapter.js";
 import { StoragePaths } from "../storage/types.js";
 import type { Logger } from "../types.js";
 import { DEFAULT_ISOLATION_ID } from "../store/types.js";
+import { formatLocalDate } from "../../utils/local-date.js";
 
 // ============================
 // Types
@@ -442,8 +443,14 @@ export async function readConversationMessages(
   afterTimestamp?: number,
   logger?: Logger,
   limit?: number,
+  storage?: StorageAdapter,
 ): Promise<ConversationMessage[]> {
-  const records = await readConversationRecords(sessionKey, baseDir, logger);
+  // 有 limit 走反向扫描：从最新分片往前读，凑够就停（K-HIGH-12）。
+  // 全量路径要把每个历史分片都读+解析完再切片——数据攒一年后每次 capture 都付这个代价。
+  if (limit != null && limit > 0) {
+    return readConversationMessagesNewest(sessionKey, baseDir, afterTimestamp, logger, limit, storage);
+  }
+  const records = await readConversationRecords(sessionKey, baseDir, logger, storage);
   const allMessages: ConversationMessage[] = [];
 
   for (const record of records) {
@@ -462,6 +469,82 @@ export async function readConversationMessages(
   }
 
   return allMessages;
+}
+
+/**
+ * 反向扫描取最新 limit 条（K-HIGH-12）。
+ *
+ * 语义与全量路径一致：cursor 之后的最新 limit 条，按时间正序返回。
+ * 分片名即日期，倒序 = 从最新往回读；文件内也倒序（append-only，最新在尾部）。
+ */
+async function readConversationMessagesNewest(
+  sessionKey: string,
+  baseDir: string,
+  afterTimestamp: number | undefined,
+  logger: Logger | undefined,
+  limit: number,
+  storage?: StorageAdapter,
+): Promise<ConversationMessage[]> {
+  const dateFilePattern = /^\d{4}-\d{2}-\d{2}\.jsonl$/;
+
+  let entries: string[];
+  try {
+    if (storage) {
+      entries = await storage.readdirNames(StoragePaths.conversationsDir, ".jsonl");
+    } else {
+      const fs = await import("node:fs/promises");
+      const path = await import("node:path");
+      const conversationsDir = path.default.join(baseDir, "conversations");
+      const dirEntries = await fs.default.readdir(conversationsDir, { withFileTypes: true });
+      entries = dirEntries.filter((entry) => entry.isFile()).map((entry) => entry.name);
+    }
+  } catch {
+    return []; // 目录不存在——首轮对话前正常
+  }
+
+  const collected: ConversationMessage[] = [];
+  const targetFiles = entries.filter((name) => dateFilePattern.test(name)).sort().reverse();
+
+  for (const fileName of targetFiles) {
+    let raw: string | null;
+    try {
+      if (storage) {
+        raw = await storage.readFile(`${StoragePaths.conversationsDir}${fileName}`);
+      } else {
+        const fs = await import("node:fs/promises");
+        const path = await import("node:path");
+        raw = await fs.default.readFile(path.default.join(baseDir, "conversations", fileName), "utf-8");
+      }
+    } catch {
+      logger?.warn?.(`${TAG} Failed to read L0 file: ${fileName}`);
+      continue;
+    }
+    if (!raw) continue;
+
+    const lines = raw.split("\n").filter((line: string) => line.trim());
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const parsed = JSON.parse(lines[i]) as Record<string, unknown>;
+        if ((parsed.sessionKey as string | undefined) !== sessionKey) continue;
+        if (typeof parsed.role !== "string" || typeof parsed.content !== "string") continue;
+        const ts = typeof parsed.timestamp === "number" ? parsed.timestamp : Date.now();
+        if (afterTimestamp && ts <= afterTimestamp) continue;
+        collected.push({
+          id: (typeof parsed.id === "string" && parsed.id) ? parsed.id : generateMessageId(),
+          role: parsed.role as "user" | "assistant",
+          content: parsed.content as string,
+          timestamp: ts,
+        });
+      } catch {
+        logger?.warn?.(`${TAG} Skipping malformed JSONL line in ${fileName}:${i + 1}`);
+      }
+      if (collected.length >= limit) break;
+    }
+    if (collected.length >= limit) break;
+  }
+
+  collected.reverse(); // 收集是倒序的，翻回正序
+  return collected.slice(-limit); // 边界文件可能多收几条，保留最新的
 }
 
 /**
@@ -494,8 +577,10 @@ export async function readConversationMessagesGroupedBySessionId(
   afterRecordedAtMs?: number,
   logger?: Logger,
   limit?: number,
+  storage?: StorageAdapter,
 ): Promise<SessionIdMessageGroup[]> {
-  const records = await readConversationRecords(sessionKey, baseDir, logger);
+  // 透传 storage：COS/rowfs/mongofs 模式下读错位置会返回空（K-HIGH-11）
+  const records = await readConversationRecords(sessionKey, baseDir, logger, storage);
 
   // Collect all messages with their sessionId, filtering by recorded_at cursor
   const allMessages: Array<{ sessionId: string; msg: ConversationMessage & { recordedAtMs: number } }> = [];
@@ -600,12 +685,3 @@ function extractUserAssistantMessages(messages: unknown[]): ConversationMessage[
   return result;
 }
 
-/**
- * Format local date as YYYY-MM-DD.
- */
-function formatLocalDate(d: Date): string {
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, "0");
-  const day = String(d.getDate()).padStart(2, "0");
-  return `${y}-${m}-${day}`;
-}

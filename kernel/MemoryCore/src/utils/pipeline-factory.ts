@@ -469,6 +469,7 @@ export function createL1Runner(opts: {
           runnerState.last_l1_cursor || undefined,
           logger,
           L1_BATCH_QUERY,
+          storage,
         );
         // NOTE: readConversationMessagesGroupedBySessionId's `limit` semantic
         // historically retains the **newest** N rows when truncating. That is
