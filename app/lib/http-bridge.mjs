@@ -3,7 +3,7 @@
 // 与 stdio 桥（mcp_agent_memory.py）共用同一份工具定义，端口 8410，端点 /mcp。
 // 生命周期跟 web 服务绑定：web 起它起，web 死它死（watchdog 拉 web 时自动重建）。
 import { spawn } from "node:child_process";
-import { existsSync, openSync, statSync, renameSync } from "node:fs";
+import { existsSync, openSync, closeSync, statSync, renameSync } from "node:fs";
 import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
@@ -32,15 +32,18 @@ export async function startHttpBridge() {
   const script = path.join(ROOT, "bridge", "mcp_http_bridge.py");
   if (!existsSync(script)) return { started: false, error: "bridge 脚本缺失" };
   const out = openLogAppend(path.join(ROOT, "logs", "http-bridge.log"));
-  bridgeProc = spawn(pythonExe(), [script], {
+  const childProc = spawn(pythonExe(), [script], {
     stdio: ["ignore", out, out],
     windowsHide: true,
     // Windows 上重定向的 python stdout 默认用 GBK：中文日志变乱码，非 GBK 字符的
     // traceback 甚至在日志 handler 内抛 UnicodeEncodeError。强制 UTF-8。
     env: { ...process.env, PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8" },
   });
-  bridgeProc.on("error", (e) => { console.error("[http-bridge] spawn error:", String(e.message || e)); bridgeProc = null; });
-  bridgeProc.on("exit", () => { bridgeProc = null; });
+  bridgeProc = childProc;
+  // #16：父进程侧立刻关 fd，否则每次起桥漏一个句柄
+  try { closeSync(out); } catch { /* 已关/平台差异不致命 */ }
+  childProc.on("error", (e) => { console.error("[http-bridge] spawn error:", String(e.message || e)); if (bridgeProc === childProc) bridgeProc = null; });
+  childProc.on("exit", () => { if (bridgeProc === childProc) bridgeProc = null; });
   // 轮询等待端口就绪（uvicorn 起服务约 1-3s；上限 10s）
   for (let i = 0; i < 20; i++) {
     await new Promise((r) => setTimeout(r, 500));

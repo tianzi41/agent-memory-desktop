@@ -14,6 +14,9 @@ import path from "node:path";
 import os from "node:os";
 import { sanitizeContent } from "./md-parser.mjs";
 
+// 单文件读取上限（#49）：与 importer.mjs 对齐，GB 级 jsonl 整读会 OOM
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+
 const HOME = os.homedir();
 const envOr = (name, fallback) => (process.env[name] || "").trim() || fallback;
 
@@ -128,7 +131,11 @@ function extractTurn(o) {
 async function parseJsonlBlocks(file) {
   const blocks = [];
   let text;
-  try { text = await readFile(file, "utf8"); } catch { return blocks; }
+  try {
+    const st = await stat(file);
+    if (st.size > MAX_FILE_BYTES) return blocks; // 超大 jsonl 不整读进内存
+    text = await readFile(file, "utf8");
+  } catch { return blocks; }
   for (const line of text.split(/\r?\n/)) {
     if (!line.trim()) continue;
     let o;

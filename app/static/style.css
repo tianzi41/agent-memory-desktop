@@ -66,6 +66,8 @@ button.big { width: 100%; padding: 13px; font-size: 15px; margin-top: 8px; }
 .card.dim { opacity: .5; }
 .card .state-ok { color: var(--accent2); }
 .card .state-bad { color: var(--err); }
+.card .state-off { color: var(--dim); }
+.cfg-check { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--dim); margin-bottom: 8px; cursor: pointer; }
 .config-info { font-size: 13px; color: var(--dim); word-break: break-all; }
 .loop-result { margin-top: 10px; font-size: 13px; white-space: pre-wrap; max-height: 180px; overflow: auto; }
 .card input { margin-bottom: 8px; }

@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title>AgentMemory Desktop</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- 安全基线（#50）：只信本源脚本/样式；禁对象嵌入、base 劫持、被 iframe 套、跨站 form -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'">
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -105,6 +107,7 @@
           <input id="editBaseUrl" placeholder="Base URL（如 https://api.stepfun.com/step_plan/v1）">
           <input id="editApiKey" placeholder="API Key">
           <input id="editModel" placeholder="模型名（如 step-3.7-flash）">
+          <label class="cfg-check"><input type="checkbox" id="editHttpBridge"> 启用 HTTP 桥（URL-only 客户端用；默认关，改完需重启软件生效）</label>
           <div class="cfg-ops">
             <button id="testModelBtn2" class="secondary">测试连接</button>
             <button id="saveCfgBtn" class="primary">保存并重启内核</button>
@@ -223,8 +226,8 @@ L3 用户画像：长期沉淀的用户理解（persona.md），内核自动生�
           <input id="sessionKeyInput" placeholder="如 tianzi（所有客户端共用同一个）">
           <button id="sessionKeySave" class="secondary">确认</button>
         </div>
-        <div id="httpBridgeState" class="config-info dim">HTTP 桥（豆包用）：检测中…</div>
-        <p class="hint">豆包等只支持「服务器 URL」的客户端：设置 → 自定义连接器 → 名称填 <b>agent-memory</b>、URL 填 <b>http://127.0.0.1:8410/mcp</b>、传输类型 HTTP、Headers 留空，保存后用上面同一个 session_key 的规则文本即可。</p>
+        <div id="httpBridgeState" class="config-info dim">HTTP 桥（URL-only 客户端）：检测中…</div>
+        <p class="hint">豆包等只支持「服务器 URL」的客户端：设置 → 自定义连接器 → 名称填 <b>agent-memory</b>、URL 填 <b>http://127.0.0.1:8410/mcp</b>、传输类型 HTTP、Headers 填 <b>Authorization: Bearer &lt;data/config/app.json 里的 gatewayApiKey&gt;</b>，保存后用上面同一个 session_key 的规则文本即可。</p>
         <p class="hint">懒人模式：勾选客户端后点写入（写入前自动备份原文件，只动 agent-memory 一项，其他 MCP 原样保留）。TRAE 没有本地配置文件，仍需手动粘贴。</p>
         <div id="injectPick" class="client-list"></div>
         <button id="injectBtn" class="secondary" disabled>写入勾选的客户端</button>

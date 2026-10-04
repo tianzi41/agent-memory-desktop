@@ -40,6 +40,11 @@ const INCLUDE_CONFIG = flag("include-config");
 const DESKTOP_CONFIG = "Q:/agent-memory-desktop/data/config";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+function portListening(port) {
+  const { execSync } = require("node:child_process");
+  const out = execSync("netstat -ano", { encoding: "utf8" });
+  return out.split(/\r?\n/).some((l) => l.includes(":" + port + " ") && /LISTENING/i.test(l));
+}
 const WEB = "http://127.0.0.1:8430";
 const stamp = () => {
   const d = new Date();
@@ -80,28 +85,33 @@ function walk(dir, base, out, skipRe) {
   const dest = uniqueDest(OUT_ROOT, `memory-backup-${stamp()}`);
   console.log("==> 备份 " + DATA_DIR + " -> " + dest);
 
-  // 1) 停内核（Web 可达才停；不可达说明没在跑，无需停也不必重启）
-  let kernelWasRunning = false;
+  // 1) 停内核：区分"请求未送达/已送达"——只要发过 stop，就必须轮询端口确认释放，
+  // 否则会把运行中的库当静止拷出撕裂快照，并把 stop 失败误判成"没在跑"跳过重启
+  let stopSent = false;
+  let stopFailed = false;
   if (!NO_RESTART) {
     try {
       const r = await fetch(WEB + "/api/kernel/stop", { method: "POST", signal: AbortSignal.timeout(10000) });
-      kernelWasRunning = (await r.json()).stopped === true;
-      if (kernelWasRunning) {
-        for (let i = 0; i < 15; i++) {
-          await sleep(1000);
-          const { execSync } = require("node:child_process");
-          const listening = execSync("netstat -ano", { encoding: "utf8" }).includes(":8420 ") &&
-            execSync("netstat -ano", { encoding: "utf8" }).split(/\r?\n/).some((l) => /:8420\s+.*LISTENING/i.test(l));
-          if (!listening) { console.log("    内核已停（端口释放 " + (i + 1) + "s）"); break; }
-        }
+      stopSent = (await r.json()).stopped === true;
+    } catch {
+      // 请求失败无法确认停没停：端口还在听=按已发送处理（必须等释放）；没听=确实没跑
+      stopSent = portListening(8420);
+      console.log(stopSent ? "    stop 未确认送达但 8420 仍在听，按已发送处理" : "    Web 不可达且 8420 无监听，按内核未运行处理");
+    }
+    if (stopSent) {
+      let released = false;
+      for (let i = 0; i < 30; i++) {
+        await sleep(1000);
+        if (!portListening(8420)) { released = true; console.log("    内核已停（端口释放 " + (i + 1) + "s）"); break; }
       }
-    } catch { console.log("    Web 服务不可达，按内核未运行处理"); }
+      if (!released) { console.error("    内核 30s 未停止，中止备份（不拷运行中的库）"); stopFailed = true; }
+    }
   }
 
   // 保险丝：任何导致进程退出的路径（未预料的异常/abort）都要把内核拉回来——
   // /api/kernel/stop 会置"用户已停"，web 看门狗不会救，只能自己救
   process.on("exit", (code) => {
-    if (kernelWasRunning && !restarted && !NO_RESTART && code !== 0) {
+    if (stopSent && !restartOk && !NO_RESTART && code !== 0) {
       try {
         require("node:child_process").spawn(
           process.execPath,
@@ -113,15 +123,21 @@ function walk(dir, base, out, skipRe) {
   });
 
   let restarted = false;
+  let restartOk = false;
   const restart = async () => {
-    if (restarted || !kernelWasRunning || NO_RESTART) return;
+    if (restarted || !stopSent || NO_RESTART) return true;
     restarted = true;
     try {
       const r = await fetch(WEB + "/api/kernel/start", { method: "POST", signal: AbortSignal.timeout(90000) });
       const j = await r.json();
+      restartOk = j.healthy === true;
       console.log("    内核已重启 healthy=" + j.healthy);
     } catch (e) { console.error("    ⚠️ 内核重启失败，请手动启动: " + e.message); }
+    return restartOk;
   };
+
+  // 停核等待超时：内核没停干净就不能拷（撕裂快照），重启后非 0 退出
+  if (stopFailed) { await restart(); process.exit(1); }
 
   try {
     // 2) 拷贝（跳过历史备份目录，避免递归备份备份）
@@ -184,7 +200,7 @@ function walk(dir, base, out, skipRe) {
     }
     console.log(`    当前保留 ${Math.min(olds.length, KEEP)} 份备份（--keep ${KEEP}）`);
 
-    await restart();
+    if (!(await restart())) process.exit(1); // 内核没拉回来＝备份成功但服务挂了，必须非 0
     console.log("✅ 备份完成: " + dest);
     process.exit(0);
   } catch (e) {

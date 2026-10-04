@@ -5,7 +5,10 @@
 import { writeFileSync, rmSync, existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
 const WATCHDOG_PS1 = path.join(ROOT, "watchdog.ps1");
@@ -18,11 +21,13 @@ const VBS_CONTENT = `' AgentMemory launcher: watchdog + tray icon (created by Ag
   `CreateObject("WScript.Shell").Run "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""${WATCHDOG_PS1}""", 0, False\n` +
   `CreateObject("WScript.Shell").Run "powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""${TRAY_PS1}""", 0, False\n`;
 
-function runPs(script) {
+// 异步 + 超时：旧版 execSync 同步阻塞事件循环数秒——/api/autostart 与卸载流程全被卡住
+async function runPs(script, timeoutMs = 10000) {
   const tmp = path.join(os.tmpdir(), `amd-ps-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.ps1`);
   writeFileSync(tmp, script, "utf8");
   try {
-    return execSync(`powershell -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`, { encoding: "utf8" }).trim();
+    const { stdout } = await execFileAsync("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp], { encoding: "utf8", timeout: timeoutMs, windowsHide: true });
+    return stdout.trim();
   } finally {
     rmSync(tmp, { force: true });
   }
@@ -30,7 +35,11 @@ function runPs(script) {
 
 // 常驻助手进程（watchdog / tray）查询与启停
 const HELPERS = ["watchdog.ps1", "tray.ps1"];
-const listHelper = (name) => `@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -match '${name}' })`;
+// 按完整 -File 绝对路径匹配：旧版按文件名子串匹配，会误杀用户自己跑的/同机另一份安装的同名脚本
+const listHelper = (name) => {
+  const p = name === "watchdog.ps1" ? WATCHDOG_PS1 : TRAY_PS1;
+  return `@(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object { $_.CommandLine -like '*${p.replaceAll("'", "''")}*' })`;
+};
 
 // app 文件夹被移动后 VBS 里的旧路径失效（开机自启静默失效）——web 启动时对比，不等则重写
 export function repairAutostartPath() {
@@ -43,10 +52,10 @@ export function repairAutostartPath() {
   return true;
 }
 
-export function autostartStatus() {
+export async function autostartStatus() {
   const running = {};
   for (const h of HELPERS) {
-    try { running[h] = (Number(runPs(`${listHelper(h)}.Count`)) || 0) > 0; }
+    try { running[h] = (Number(await runPs(`${listHelper(h)}.Count`)) || 0) > 0; }
     catch { running[h] = false; }
   }
   return {
@@ -57,25 +66,27 @@ export function autostartStatus() {
   };
 }
 
-export function setAutostart(enable) {
+export async function setAutostart(enable) {
   if (enable) {
     writeFileSync(VBS_PATH, VBS_CONTENT, "utf8");
-    killHelpers();
+    await killHelpers();
     for (const p of [WATCHDOG_PS1, TRAY_PS1]) {
       const q = p.replaceAll("'", "''");
-      runPs(`Start-Process powershell -ArgumentList @('-NoProfile','-WindowStyle Hidden','-ExecutionPolicy','Bypass','-File','${q}')`);
+      // 路径显式加引号：PS 5.1 的 Start-Process 不会给含空格的数组元素自动加引号，
+      // 安装目录一带空格守护就静默起不来（与 watchdog.ps1 同款修复）
+      await runPs(`Start-Process powershell -ArgumentList @('-NoProfile','-WindowStyle Hidden','-ExecutionPolicy','Bypass','-File',('"{0}"' -f '${q}'))`);
     }
     return autostartStatus();
   }
   rmSync(VBS_PATH, { force: true });
-  killHelpers();
+  await killHelpers();
   return autostartStatus();
 }
 
-function killHelpers() {
+async function killHelpers() {
   for (const h of HELPERS) {
     try {
-      runPs(`${listHelper(h)} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`);
+      await runPs(`${listHelper(h)} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`);
     } catch { /* 进程不存在时忽略 */ }
   }
 }

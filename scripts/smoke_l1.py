@@ -26,6 +26,37 @@ from datetime import datetime
 
 GW = "http://127.0.0.1:8420"
 
+# 绕过系统代理：urllib 默认 opener 会读 Windows 代理设置，
+# 用户配了代理且没把 127.0.0.1 加入绕过列表时，连本机网关都被送代理——冒烟假失败
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+# 内核 l1-extractor 的已知瞬态抖动（实测：reason=no_json/empty_scenes，
+# 重试或时间窗口过后即恢复）——仅这两类允许冒烟重试，最多 2 次
+TRANSIENT_REASONS = {"no_json", "empty_scenes"}
+
+
+def _last_empty_reason(session: str) -> str:
+    """从内核日志读该 session 最近的 l1-empty 原因，判断失败是否瞬态。
+    日志不可达返回 unknown——按非瞬态处理，绝不静默吞失败。"""
+    import os
+
+    for p in (os.environ.get("TDAI_KERNEL_LOG"),
+              os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs", "kernel.log")):
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="ignore") as f:
+                lines = f.readlines()[-500:]
+        except Exception:
+            continue
+        reason = ""
+        for ln in lines:
+            if "l1-empty" in ln and session in ln:
+                import re
+                m = re.search(r"reason=(\w+)", ln)
+                if m:
+                    reason = m.group(1)
+        return reason or "unknown"
+    return "unknown"
 
 def _req(path: str, payload: dict | None = None) -> dict:
     data = json.dumps(payload).encode("utf-8") if payload is not None else None
@@ -34,7 +65,7 @@ def _req(path: str, payload: dict | None = None) -> dict:
         method="POST" if data else "GET",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as r:
+        with _OPENER.open(req, timeout=30) as r:
             body = r.read().decode("utf-8")
             return json.loads(body) if body else {}
     except urllib.error.HTTPError as e:
@@ -65,6 +96,16 @@ def main() -> int:
     base_done = (pw or {}).get("tasksCompleted")
     print("网关 ok（pipelineWorker: %s）" % ("有" if pw else "无，不阻塞"))
 
+    # 0.5) 阴性对照：capture 前搜 token 必须搜不到——否则"搜到了"可能来自别处残留，
+    # 证明不了本轮链路（capture 前后对比才是有效断言）
+    try:
+        pre = _req("/search/memories", {"query": token, "limit": 5})
+        if token in json.dumps(pre, ensure_ascii=False):
+            print("FAIL capture 前 token 已可被检索（命名空间污染或假阳性）")
+            return 1
+    except Exception as e:
+        print("(阴性对照 search 失败不阻塞: %s)" % e)
+
     # 1) capture 两轮（everyNConversations=2，两轮即可触发提炼，不用干等 idle）
     for i in range(2):
         r = _req("/capture", {
@@ -85,30 +126,62 @@ def main() -> int:
     except Exception as e:
         print("(session/end 失败不阻塞: %s)" % e)
 
-    # 3) 轮询：token 可被 search 到 = 提炼完成（比全局计数器可靠）
-    print("等待提炼（最多 %ds）..." % args.timeout)
-    deadline = time.time() + args.timeout
-    found = False
-    while time.time() < deadline:
-        time.sleep(5)
-        try:
-            s = _req("/search/memories", {"query": token, "limit": 5})
-        except Exception as e:
-            print("(search 失败，继续等: %s)" % e)
-            continue
-        if token in json.dumps(s, ensure_ascii=False):
-            found = True
-            break
-        if pw is not None:
+    # 3) 轮询 + 瞬态重试：token 可被 search 到 = 提炼完成（比全局计数器可靠）。
+    #    失败时先查 reason：仅 no_json/empty_scenes 类瞬态允许重试（最多 2 次），
+    #    非瞬态或超限一律 FAIL；最终输出必须带 reason 和重试次数，不静默吞失败
+    retries = 0
+    reason = "none"
+    while True:
+        print("等待提炼（最多 %ds，第 %d 轮）..." % (args.timeout, retries + 1))
+        deadline = time.time() + args.timeout
+        found = False
+        while time.time() < deadline:
+            time.sleep(5)
             try:
-                cur = ((_req("/health").get("services") or {}).get("pipelineWorker")) or {}
-                print("  [剩余 %3ds] tasksCompleted=%s" % (int(deadline - time.time()), cur.get("tasksCompleted")))
+                s = _req("/search/memories", {"query": token, "limit": 5})
+            except Exception as e:
+                print("(search 失败，继续等: %s)" % e)
+                continue
+            if token in json.dumps(s, ensure_ascii=False):
+                found = True
+                break
+            if pw is not None:
+                try:
+                    cur = ((_req("/health").get("services") or {}).get("pipelineWorker")) or {}
+                    print("  [剩余 %3ds] tasksCompleted=%s" % (int(deadline - time.time()), cur.get("tasksCompleted")))
+                except Exception:
+                    pass
+        if found:
+            print("PASS L1 提炼完成，token 已可检索（reason=%s，重试 %d 次）" % (reason, retries))
+            break
+        reason = _last_empty_reason(session)
+        if reason in TRANSIENT_REASONS and retries < 2:
+            retries += 1
+            print("瞬态失败 reason=%s，重试 %d/2（再喂两轮重新等）" % (reason, retries))
+            for i in range(2):
+                try:
+                    r = _req("/capture", {
+                        "session_key": session,
+                        "user_content": "冒烟测试重试第 %d 轮：本轮的校验令牌是 %s，请记住它。" % (i + 1, token),
+                        "assistant_content": "已记住校验令牌 %s（重试第 %d 轮）。" % (token, i + 1),
+                    })
+                    n = (r or {}).get("l0_recorded", 0)
+                    print("重试 capture #%d -> l0_recorded=%s" % (i + 1, n))
+                    if not n:
+                        print("FAIL 重试 capture 第 %d 轮没有落 L0: %r" % (i + 1, r))
+                        return 1
+                except Exception as e:
+                    print("FAIL 重试 capture 异常: %s" % e)
+                    return 1
+            try:
+                _req("/session/end", {"session_key": session})
             except Exception:
                 pass
-    if not found:
-        print("FAIL 等待 %ds 后 token 仍未出现在 search 结果——L1 提炼链没通" % args.timeout)
+            continue
+        print("FAIL 等待后 token 未出现（reason=%s，重试 %d 次）——%s" % (
+            reason, retries,
+            "瞬态重试超限" if reason in TRANSIENT_REASONS else "非瞬态失败"))
         return 1
-    print("PASS L1 提炼完成，token 已可检索")
 
     # 4) recall 也该能拿到（召回链 = L3->L2->L1->L0）
     try:
@@ -135,7 +208,7 @@ def main() -> int:
             pass
 
     print("")
-    print("=== SMOKE PASS ===")
+    print("=== SMOKE PASS === (reason=%s, retries=%d)" % (reason, retries))
     return 0
 
 

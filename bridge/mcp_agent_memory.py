@@ -71,7 +71,11 @@ def _redact(text: str) -> str:
 
     def _mask(m):
         s = m.group(0)
-        return s if len(s) < 12 else s[:4] + "***REDACTED***" + s[-4:]
+        # 短凭据（<24 位）全掩：旧版留头 4 尾 4，12-16 位弱 token 被打码后仍剩 2/3 原文；
+        # 长凭据只留头 4 位供辨认，尾部不再保留
+        if len(s) < 24:
+            return "***REDACTED***"
+        return s[:4] + "***REDACTED***"
 
     for pattern in _REDACT_PATTERNS:
         text = pattern.sub(_mask, text)
@@ -81,6 +85,16 @@ def _redact(text: str) -> str:
             return _mask(m) if _KEY_CONTEXT.search(ctx) else m.group(0)
         text = pattern.sub(_weak, text)
     return text
+
+
+def _clamp(v, lo: int = 1, hi: int = 50) -> int:
+    """top_k/limit 入口钳制：模型传 limit=1000000 会原样打到网关，
+    巨量 JSON 撑爆上下文或拖垮网关（审计 #35）。"""
+    try:
+        v = int(v)
+    except Exception:
+        return hi
+    return max(lo, min(v, hi))
 
 
 def _client() -> TdaiMemory:
@@ -150,7 +164,7 @@ def _capture(session_key: str, user_content: str, assistant_content: str) -> str
 
 def _recall(query: str, session_key: str, top_k: int) -> str:
     try:
-        return _envelope("recall", _client().recall(query=query, session_key=session_key, top_k=top_k))
+        return _envelope("recall", _client().recall(query=query, session_key=session_key, top_k=_clamp(top_k)))
     except Exception as e:
         return _tool_error("recall", e)
 
@@ -158,7 +172,7 @@ def _recall(query: str, session_key: str, top_k: int) -> str:
 def _search(query: str, limit: int, type: str, scene: str) -> str:
     try:
         return _envelope("search", _client().search_memories(
-            query=query, limit=limit, type=type or None, scene=scene or None))
+            query=query, limit=_clamp(limit), type=type or None, scene=scene or None))
     except Exception as e:
         return _tool_error("search", e)
 
@@ -166,7 +180,7 @@ def _search(query: str, limit: int, type: str, scene: str) -> str:
 def _conversations(query: str, session_key: str, limit: int) -> str:
     try:
         return _envelope("conversations", _client().search_conversations(
-            query=query, session_key=session_key or None, limit=limit))
+            query=query, session_key=session_key or None, limit=_clamp(limit)))
     except Exception as e:
         return _tool_error("conversations", e)
 

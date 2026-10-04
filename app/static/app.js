@@ -31,7 +31,12 @@ async function init() {
 async function api(path, opts) {
   try {
     const r = await fetch(path, opts);
-    const j = await r.json().catch(() => ({}));
+    // #21：先取文本再 JSON.parse——200 但非 JSON（错误页/代理拦截页）时旧版
+    // 静默变成 {} 当成功，调用方裸解构直接 TypeError（这也是 #48 各错误态分支的地基）
+    const text = await r.text();
+    let j;
+    try { j = text ? JSON.parse(text) : {}; }
+    catch { return { error: r.ok ? "响应解析失败（非 JSON）" : "HTTP " + r.status + "（非 JSON）" }; }
     if (!r.ok && j && typeof j === "object" && !("error" in j)) return { error: "HTTP " + r.status };
     return j;
   } catch (e) {
@@ -81,11 +86,13 @@ $("testModelBtn").addEventListener("click", async () => {
 
 $("toStep2").addEventListener("click", () => gotoStep(2));
 $("back1").addEventListener("click", () => gotoStep(1));
-$("toStep3").addEventListener("click", () => gotoStep(3));
+// #11：toStep3 的空跳转绑定已删——跳转只在下面那个异步处理器里、注入成功后发生
 
 async function loadClients() {
   const clients = await api("/api/clients");
   const box = $("clientList");
+  // 接口失败不能显示成"未安装"——把故障伪装成用户环境问题（#48 假绿）
+  if (clients.error) { box.innerHTML = `<span class="bad">❌ 客户端检测失败：${esc(clients.error)}</span>`; return; }
   box.innerHTML = "";
   for (const [id, c] of Object.entries(clients)) {
     const div = document.createElement("div");
@@ -93,8 +100,8 @@ async function loadClients() {
     const canCheck = c.injectable && c.installed;
     div.innerHTML = `
       <input type="checkbox" id="cb-${id}" ${canCheck ? "" : "disabled"}>
-      <span class="name">${c.name}</span>
-      <span class="note">${c.installed ? (c.injectable ? "已安装 · 支持自动写入" + (c.note ? " · " + c.note : "") : (c.note || "")) : "未安装"}</span>`;
+      <span class="name">${esc(c.name)}</span>
+      <span class="note">${esc(c.installed ? (c.injectable ? "已安装 · 支持自动写入" + (c.note ? " · " + c.note : "") : (c.note || "")) : "未安装")}</span>`;
     box.appendChild(div);
     if (id === "trae") {
       const cb = div.querySelector("input");
@@ -160,6 +167,7 @@ async function renderInjectPick() {
   const box = $("injectPick");
   if (!box) return;
   const clients = await api("/api/clients").catch(() => ({}));
+  if (clients.error) { box.innerHTML = `<span class="bad">❌ 客户端检测失败：${esc(clients.error)}</span>`; $("injectBtn").disabled = true; return; }
   box.innerHTML = "";
   let any = false;
   for (const [id, c] of Object.entries(clients)) {
@@ -170,7 +178,7 @@ async function renderInjectPick() {
     div.innerHTML = `
       <input type="checkbox" id="icb-${id}" checked>
       <span class="name">${c.name}</span>
-      <span class="note">${c.note || "已安装"}</span>`;
+      <span class="note">${esc(c.note || "已安装")}</span>`;
     box.appendChild(div);
   }
   if (!any) box.innerHTML = "<p class='dim'>未检测到可自动写入的客户端（Cursor / Claude Desktop / WorkBuddy 均未安装）</p>";
@@ -183,10 +191,11 @@ $("injectBtn").addEventListener("click", async () => {
   if (!ids.length) { out.innerHTML = "先勾选要写入的客户端"; return; }
   out.textContent = "写入中…";
   const d = await post("/api/inject", { clients: ids });
+  if (d.error) { out.innerHTML = `<span class="bad">❌ 写入失败：${esc(d.error)}</span>`; return; }
   const lines = Object.entries(d.results || {}).map(([id, r]) => {
     const nm = document.querySelector(`#icb-${id}`)?.closest(".client-item")?.querySelector(".name")?.textContent || id;
     return r.ok
-      ? `✅ ${nm}：已写入 ${r.file}${r.backup ? "（原文件已备份到 backup 目录）" : ""}`
+      ? `✅ ${esc(nm)}：已写入 ${esc(r.file)}${r.backup ? "（原文件已备份到 backup 目录）" : ""}`
       : `❌ ${nm}：${r.error || "失败"}`;
   });
   if (d.results?.workbuddy?.ok) lines.push("⚠️ WorkBuddy 还需到 连接器管理 → 自定义连接 对 agent-memory 点「信任」后生效");
@@ -215,7 +224,10 @@ $("exportBtn").addEventListener("click", async () => {
   const a = document.createElement("a");
   a.href = "/backup/" + encodeURIComponent(d.name);
   a.download = d.name;
+  // 必须挂进文档再 click：Firefox 对未挂载 DOM 的锚点不触发下载（Chrome 不挑）
+  document.body.appendChild(a);
   a.click();
+  a.remove();
 });
 
 $("importBackupBtn").addEventListener("click", () => $("restoreFile").click());
@@ -223,6 +235,8 @@ $("restoreFile").addEventListener("change", async () => {
   const f = $("restoreFile").files[0];
   if (!f) return;
   const out = $("backupResult");
+  // 上传前预检：与服务端 500MB 上限对齐——超限的包整读进内存只会把页面 OOM
+  if (f.size > 500 * 1024 * 1024) { out.innerHTML = `<span class="bad">❌ 文件 ${(f.size / 1024 / 1024).toFixed(0)}MB 超过 500MB 上限</span>`; $("restoreFile").value = ""; return; }
   if (!confirm(`确定用「${f.name}」恢复记忆库？\n\n当前记忆会被整体替换（恢复前自动滚存一份到 backup 目录，可手动找回）。此操作需要停内核，约 30-60 秒。`)) { $("restoreFile").value = ""; return; }
   out.textContent = "上传中…（文件较大时请耐心）";
   $("importBackupBtn").disabled = true;
@@ -291,11 +305,13 @@ function copyText(text, okId) {
 }
 
 $("toStep3").addEventListener("click", async () => {
-  // 进步骤 3 前先执行注入
+  // 进步骤 3 前先执行注入（#11：这是 toStep3 的唯一绑定；
+  // 注入失败 alert 并停留本步，绝不带着没写入的配置进完成页）
   const ids = [];
   document.querySelectorAll("#clientList input:checked").forEach(cb => ids.push(cb.id.replace("cb-", "")));
   if (ids.length) {
     const d = await post("/api/inject", { clients: ids });
+    if (d.error) { alert("写入客户端配置失败：" + (d.error?.message || d.error) + "\n将停留在本步，可重试；TRAE 手动粘贴配置不受影响。"); return; }
     injected = Object.values(d.results).every(r => r.ok);
   }
   gotoStep(3);
@@ -366,6 +382,7 @@ $("editCfgBtn").addEventListener("click", async () => {
     $("editBaseUrl").value = s.baseUrl || "";
     $("editApiKey").value = sec.apiKey || "";
     $("editModel").value = s.model || "";
+    $("editHttpBridge").checked = s.httpBridge?.enabled === true;
     form.classList.remove("hidden");
   } else {
     form.classList.add("hidden");
@@ -384,12 +401,12 @@ $("testModelBtn2").addEventListener("click", async () => {
 });
 
 $("saveCfgBtn").addEventListener("click", async () => {
-  const baseUrl = $("editBaseUrl").value.trim(), apiKey = $("editApiKey").value.trim(), model = $("editModel").value.trim();
+  const baseUrl = $("editBaseUrl").value.trim(), apiKey = $("editApiKey").value.trim(), model = $("editModel").value.trim(), httpBridge = $("editHttpBridge").checked;
   if (!baseUrl || !apiKey || !model) { alert("三项都要填"); return; }
   if (!confirm("保存后将重启记忆内核（约 30-60 秒），继续？")) return;
   const out = $("cfgTestResult");
   out.textContent = "保存并重启内核中…";
-  const d = await post("/api/config/update", { baseUrl, apiKey, model });
+  const d = await post("/api/config/update", { baseUrl, apiKey, model, httpBridge });
   if (d.ok) { out.innerHTML = `<span class="state-ok">✅ 已保存，内核重启中（${d.kernel?.ok ? "已拉起" : "启动中"}）</span>`; setTimeout(refresh, 4000); }
   else { out.innerHTML = `<span class="state-bad">❌ ${esc(d.error || "失败")}</span>`; }
 });
@@ -429,13 +446,16 @@ async function refresh() {
   refreshHttpBridge(s);
 }
 
-// HTTP 桥状态（豆包等 URL 型客户端依赖它）
+// HTTP 桥状态（URL-only 客户端依赖它；enabled/running 双态，默认关闭）
 function refreshHttpBridge(s) {
   const el = $("httpBridgeState");
   if (!el || !s?.httpBridge) return;
-  el.innerHTML = s.httpBridge.running
-    ? `HTTP 桥（豆包用）：<span class="state-ok">● 运行中</span> ${esc(s.httpBridge.url)}`
-    : `HTTP 桥（豆包用）：<span class="state-bad">● 未运行</span>（随本页面服务自动起停，重启软件即可恢复）`;
+  const label = "HTTP 桥（URL-only 客户端）：";
+  el.innerHTML = s.httpBridge.enabled === false
+    ? `${label}<span class="state-off">● 已关闭</span>（默认关闭；要接入就在「修改模型配置」里勾选启用，重启软件生效）`
+    : s.httpBridge.running
+      ? `${label}<span class="state-ok">● 运行中</span> ${esc(s.httpBridge.url)}`
+      : `${label}<span class="state-bad">● 未运行</span>（已启用但进程没起来${s.httpBridge.lastError ? "：" + esc(s.httpBridge.lastError) : ""}；详见 logs/http-bridge.log）`;
 }
 
 // 今日统计（L0 新增 / 提炼任务，跨天自动清零，关页面不丢）
@@ -522,35 +542,48 @@ async function previewSelected() {
   box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
+// #22：赋值前先清旧句柄——刷新页面恢复轮询后又点开始，旧 interval 会泄漏永久空转
+function startImportPolling(which) {
+  if (which === "tool") { clearInterval(toolImportTimer); return setInterval(pollImport, 2000); }
+  clearInterval(importTimer); return setInterval(pollImport, 2000);
+}
+
 async function startImportJob() {
   const files = [...document.querySelectorAll(".fcb:checked")].map(cb => cb.dataset.f);
   if (!files.length) return;
   const d = await post("/api/import/start", { files });
   if (!d.ok) { alert(d.error); return; }
   $("importProgress").classList.remove("hidden");
-  importTimer = setInterval(pollImport, 2000);
+  importTimer = startImportPolling("import");
 }
 
 async function pollImport() {
-  const s = await api("/api/import/status");
-  if (s.error) return; // 服务无响应：保留上次进度显示，等下一轮
-  const pct = s.total ? Math.round((s.done / s.total) * 100) : 0;
-  const fname = s.currentFile.split(/[\\/]/).pop() || "";
-  const phaseTxt = s.phase === "waiting_llm" ? "等待模型提炼…" : "喂入中";
-  const failTxt = s.failures.length ? `<br><span class="bad">失败 ${s.failures.length} 批</span>` : "";
-  const doneTxt = !s.running
-    ? `<br><b>导入${s.phase === "done" ? "完成" : "已中止"}</b>${s.failures.length ? `，失败 ${s.failures.length} 批（可稍后重跑失败项目）` : "，无失败"}`
-    : "";
-  if ($("barFill")) $("barFill").style.width = pct + "%";
-  if ($("progressText")) $("progressText").innerHTML =
-    `文件 ${s.done}/${s.total}（${pct}%） · 当前：${esc(fname)} 第 ${s.currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
-  if ($("toolBarFill")) $("toolBarFill").style.width = pct + "%";
-  if ($("toolProgressText")) $("toolProgressText").innerHTML =
-    `项目 ${s.done}/${s.total}（${pct}%） · 当前：${esc(fname)} 第 ${s.currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
-  if (!s.running) { clearInterval(importTimer); clearInterval(toolImportTimer); importTimer = toolImportTimer = null; }
+  // 默认值解构 + finally 清定时器：任一轮响应缺字段都不能抛——
+  // 异常发生在 clearInterval 之前会让 interval 永久空转（每 2s 报错，UI 卡在旧进度）
+  try {
+    const s = await api("/api/import/status");
+    if (s.error) return; // 服务无响应：保留上次进度显示，等下一轮
+    const { total = 0, done = 0, currentFile = "", currentRound = 0, failures = [], running = false, phase = "" } = s;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    const fname = String(currentFile).split(/[\\/]/).pop() || "";
+    const phaseTxt = phase === "waiting_llm" ? "等待模型提炼…" : "喂入中";
+    const failTxt = failures.length ? `<br><span class="bad">失败 ${failures.length} 批</span>` : "";
+    const doneTxt = !running
+      ? `<br><b>导入${phase === "done" ? "完成" : "已中止"}</b>${failures.length ? `，失败 ${failures.length} 批（可稍后重跑失败项目）` : "，无失败"}`
+      : "";
+    if ($("barFill")) $("barFill").style.width = pct + "%";
+    if ($("progressText")) $("progressText").innerHTML =
+      `文件 ${done}/${total}（${pct}%） · 当前：${esc(fname)} 第 ${currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
+    if ($("toolBarFill")) $("toolBarFill").style.width = pct + "%";
+    if ($("toolProgressText")) $("toolProgressText").innerHTML =
+      `项目 ${done}/${total}（${pct}%） · 当前：${esc(fname)} 第 ${currentRound} 轮 · ${phaseTxt}` + failTxt + doneTxt;
+    if (!running) { clearInterval(importTimer); clearInterval(toolImportTimer); importTimer = toolImportTimer = null; }
+  } catch {
+    clearInterval(importTimer); clearInterval(toolImportTimer); importTimer = toolImportTimer = null;
+  }
 }
 
-$("abortBtn").addEventListener("click", () => post("/api/import/abort"));
+$("abortBtn").addEventListener("click", () => { if (confirm("确定中止导入？已完成进度作废，不可续跑。")) post("/api/import/abort"); });
 
 // ---------- 从 WorkBuddy / Qwen 导入 ----------
 let toolProjectMap = {}; // sessionKey -> project 对象
@@ -584,7 +617,7 @@ $("toolScanBtn").addEventListener("click", async () => {
 
 function renderToolGroup(title, projects, root) {
   if (!projects.length) return "";
-  let html = `<div class="tool-group"><div class="tool-group-title">${title}（${projects.length} 个项目）${root ? ` <span class="dim">· ${esc(root)}</span>` : ""}</div><div class="file-list">`;
+  let html = `<div class="tool-group"><div class="tool-group-title">${esc(title)}（${projects.length} 个项目）${root ? ` <span class="dim">· ${esc(root)}</span>` : ""}</div><div class="file-list">`;
   for (const p of projects) {
     toolProjectMap[p.sessionKey] = p;
     const span = p.startTime && p.endTime ? ` ${fmtTime(p.startTime)} ~ ${fmtTime(p.endTime)}` : "";
@@ -605,10 +638,10 @@ async function startToolImportJob() {
   const d = await post("/api/tool-import/start", { projects });
   if (!d.ok) { alert(d.error); return; }
   $("toolImportProgress").classList.remove("hidden");
-  toolImportTimer = setInterval(pollImport, 2000);
+  toolImportTimer = startImportPolling("tool");
 }
 
-$("toolAbortBtn").addEventListener("click", () => post("/api/import/abort"));
+$("toolAbortBtn").addEventListener("click", () => { if (confirm("确定中止导入？已完成进度作废，不可续跑。")) post("/api/import/abort"); });
 
 // ---------- M3：记忆管理 ----------
 let l1Offset = 0, l1Total = 0;
@@ -626,29 +659,40 @@ document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () =>
   if (t.dataset.tab === "l3") loadL3();
 }));
 
+let l1Loading = false; // #23：in-flight 锁，防快速连点加载出重复页
 async function loadL1(append) {
-  if (!append) l1Offset = 0;
-  const q = $("l1Query").value.trim();
-  const type = $("l1Type").value;
-  const p = new URLSearchParams({ limit: L1_PAGE, offset: l1Offset });
-  if (q) p.set("q", q);
-  if (type) p.set("type", type);
-  const d = await api("/api/memories/l1?" + p);
-  if (d.error) { $("l1List").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
-  l1Total = d.data?.total ?? d.items?.length ?? 0;
-  const items = d.data?.items ?? d.items ?? [];
-  const html = items.map(m => `
-    <label class="mem-item">
-      <input type="checkbox" class="micb" data-id="${esc(m.id)}">
-      <div class="mem-body">
-        <div class="mem-head"><span class="tag">${m.type}</span><span class="dim">v${m.version} · ${fmtTime(m.updated_at)}</span><button class="mini edit-btn" data-id="${m.id}">编辑</button></div>
-        <div class="mem-text" id="mt-${m.id}">${esc(m.content)}</div>
-        ${m.background ? `<div class="mem-bg">${esc(m.background)}</div>` : ""}
-      </div>
-    </label>`).join("");
-  $("l1List").innerHTML = append ? $("l1List").innerHTML + html : (html || "<p class='dim'>暂无记忆</p>");
-  l1Offset += items.length;
-  $("l1More").classList.toggle("hidden", !(q || l1Offset < l1Total));
+  if (l1Loading) return;
+  l1Loading = true;
+  try {
+    if (!append) l1Offset = 0;
+    const q = $("l1Query").value.trim();
+    const type = $("l1Type").value;
+    const p = new URLSearchParams({ limit: L1_PAGE, offset: l1Offset });
+    if (q) p.set("q", q);
+    if (type) p.set("type", type);
+    const d = await api("/api/memories/l1?" + p);
+    if (d.error) { $("l1List").innerHTML = `<span class="bad">❌ ${esc(d.error)}</span>`; return; }
+    l1Total = d.data?.total ?? d.items?.length ?? 0;
+    const items = d.data?.items ?? d.items ?? [];
+    const html = items.map(m => `
+      <label class="mem-item">
+        <input type="checkbox" class="micb" data-id="${esc(m.id)}">
+        <div class="mem-body">
+          <div class="mem-head"><span class="tag">${esc(m.type)}</span><span class="dim">v${esc(m.version)} · ${fmtTime(m.updated_at)}</span><button class="mini edit-btn" data-id="${esc(m.id)}">编辑</button></div>
+          <div class="mem-text" id="mt-${esc(m.id)}">${esc(m.content)}</div>
+          ${m.background ? `<div class="mem-bg">${esc(m.background)}</div>` : ""}
+        </div>
+      </label>`).join("");
+    // #23：追加用 insertAdjacentHTML——整体重写 innerHTML 会重建 DOM，
+    // 用户已勾选的 .micb 勾选状态静默丢失
+    if (append) $("l1List").insertAdjacentHTML("beforeend", html);
+    else $("l1List").innerHTML = html || "<p class='dim'>暂无记忆</p>";
+    l1Offset += items.length;
+    // #23：到末页就收起（旧版 !(q||...) 在带关键词时恒显示，点击后空转）
+    $("l1More").classList.toggle("hidden", l1Offset < l1Total);
+  } finally {
+    l1Loading = false;
+  }
 }
 
 // L1 编辑（事件委托：编辑 / 保存 / 取消）
@@ -660,7 +704,7 @@ $("l1List").addEventListener("click", async e => {
     const box = $("mt-" + id);
     if (!box) return;
     const cur = box.textContent;
-    box.innerHTML = `<textarea class="edit-ta" rows="5"></textarea><div class="edit-ops"><button class="mini save-btn" data-id="${id}">保存</button><button class="mini cancel-btn">取消</button></div>`;
+    box.innerHTML = `<textarea class="edit-ta" rows="5"></textarea><div class="edit-ops"><button class="mini save-btn" data-id="${esc(id)}">保存</button><button class="mini cancel-btn">取消</button></div>`;
     box.querySelector("textarea").value = cur;
     box.querySelector("textarea").focus();
     return;
@@ -701,7 +745,7 @@ $("l0Load").addEventListener("click", async () => {
   $("l0List").innerHTML = msgs.length ? msgs.map(m => `
     <div class="mem-item">
       <div class="mem-body">
-        <div class="mem-head"><span class="tag">${m.role}</span><span class="dim">${m.score !== undefined ? "score " + m.score.toFixed(3) + " · " : ""}${fmtTime(m.timestamp || m.created_at)}</span></div>
+        <div class="mem-head"><span class="tag">${esc(m.role)}</span><span class="dim">${m.score !== undefined ? "score " + m.score.toFixed(3) + " · " : ""}${fmtTime(m.timestamp || m.created_at)}</span></div>
         <div class="mem-text">${esc((m.content || "").slice(0, 400))}</div>
       </div>
     </div>`).join("") : "<p class='dim'>暂无对话流水</p>";
@@ -715,7 +759,7 @@ async function loadL2() {
   $("l2List").innerHTML = entries.length ? entries.map(e => `
     <div class="mem-item clickable" data-path="${esc(e.path)}">
       <div class="mem-body">
-        <div class="mem-head"><span class="tag">L2</span><span class="dim">${e.type || "file"}</span></div>
+        <div class="mem-head"><span class="tag">L2</span><span class="dim">${esc(e.type || "file")}</span></div>
         <div class="mem-text">${esc(e.path)}</div>
       </div>
     </div>`).join("") : "<p class='dim'>暂无场景文件（L2 由内核在多轮提炼后自动生成）</p>";
@@ -729,6 +773,8 @@ async function loadL2() {
 
 async function loadL3() {
   const d = await api("/api/memories/l3");
+  // 失败不能伪装成"暂无"（#48 假绿）
+  if (d.error) { $("l3Content").textContent = "加载失败：" + (d.error?.message || d.error || JSON.stringify(d)); return; }
   $("l3Content").textContent = d.data?.content || "暂无画像内容（L3 由内核在长期使用中自动沉淀，L2 场景积累后生成）";
 }
 

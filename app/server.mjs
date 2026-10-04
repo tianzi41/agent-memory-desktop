@@ -3,7 +3,7 @@ import http from "node:http";
 import { readFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { health, startKernel, stopKernel, loadAppConfig, kernelRunning } from "./lib/kernel.mjs";
+import { health, startKernel, stopKernel, loadAppConfig, kernelRunning, beginKernelMaintenance, endKernelMaintenance, kernelInMaintenance } from "./lib/kernel.mjs";
 import { saveSetup, defaultDataDir, updateLlmConfig, getSessionKey, setSessionKey } from "./lib/config-gen.mjs";
 import { detectClients, injectClients, traeConfigText } from "./lib/inject.mjs";
 import { scanDir } from "./lib/md-parser.mjs";
@@ -87,15 +87,38 @@ async function gatewayData(pathname, payload, v3 = false) {
   }
 }
 
+// HTTP 桥失败原因（#36）：进程没起来时把日志尾部最后一条可读错误带出来——
+// 不然 UI 只有干巴巴的"没起来"，用户分不清是端口占用还是缺依赖
+function httpBridgeLastError() {
+  try {
+    const p = path.join(__dirname, "..", "logs", "http-bridge.log");
+    if (!existsSync(p)) return null;
+    const lines = readFileSync(p, "utf8").split(/\r?\n/).filter(Boolean).slice(-30);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (/ERROR|Exception|Traceback|Errno|WinError|拒绝|失败|failed|Cannot|address already in use/i.test(lines[i])) {
+        return lines[i].slice(0, 300);
+      }
+    }
+    return null;
+  } catch { return null; }
+}
+
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
   try {
     // ---- 安全：拒绝跨站调用 ----
     // 浏览器发往 127.0.0.1 的请求必带 Origin 头；本地 curl/脚本无 Origin（可信）放行。
     // 没有这道关，任意网页的 JS 都能 fetch 打我们的 API（CSRF：改配置、写 mcp.json、停服务）
+    // Host 校验（DNS rebinding 防线）：恶意网页把域名解析到 127.0.0.1 后，浏览器带来的
+    // Host 是它的域名——非本机域一律拒。GET /backup 无 Origin，这条同时兜住备份下载面
+    const hostName = (req.headers.host || "").split(":")[0];
+    if ((url.pathname.startsWith("/api/") || url.pathname.startsWith("/backup/")) && !/^(127\.0\.0\.1|localhost)$/.test(hostName)) {
+      json(res, 403, { ok: false, error: "forbidden host（仅接受本机页面发起的请求）" });
+      return;
+    }
     if (url.pathname.startsWith("/api/")) {
       const origin = req.headers.origin;
-      if (origin && !/^https?:\/\/(127\.0\.0\.1|localhost)(:8430)?$/.test(origin)) {
+      if (origin && !/^https?:\/\/(127\.0\.0\.1|localhost):8430$/.test(origin)) {
         json(res, 403, { ok: false, error: "forbidden origin（仅接受本机页面发起的请求）" });
         return;
       }
@@ -138,7 +161,7 @@ const server = http.createServer(async (req, res) => {
         // 改由 /api/config/secret 在编辑表单打开的瞬间按需取
         dataDir: cfg?.dataDir || defaultDataDir(),
         gateway: { healthy: h.ok, detail: h.body?.services ? { pipeline: h.body.services.pipelineWorker } : h.error },
-        httpBridge: { running: httpBridgeRunning(), url: "http://127.0.0.1:8410/mcp" },
+        httpBridge: { running: httpBridgeRunning(), enabled: cfg?.httpBridge === true, url: "http://127.0.0.1:8410/mcp", lastError: cfg?.httpBridge === true && !httpBridgeRunning() ? httpBridgeLastError() : null },
         gatewayPort: cfg?.gatewayPort || 8420,
         kernelManaged: kernelRunning(),
       });
@@ -210,13 +233,33 @@ const server = http.createServer(async (req, res) => {
 
     // 修改 LLM 配置（Base URL / Key / 模型）——增量更新，保留其他手工调优项；保存后重启内核生效
     if (url.pathname === "/api/config/update" && req.method === "POST") {
-      const { baseUrl, apiKey, model } = await readBody(req);
+      const { baseUrl, apiKey, model, httpBridge } = await readBody(req);
       if (!baseUrl || !apiKey || !model) { json(res, 400, { ok: false, error: "缺参数" }); return; }
-      updateLlmConfig({ baseUrl, apiKey, model });
-      stopKernel();
-      await sleep(2000);
-      const k = await startKernel();
-      json(res, 200, { ok: true, kernel: k });
+      updateLlmConfig({ baseUrl, apiKey, model, httpBridge });
+      // 停核重启全程进维护窗：看护此时插手会双 spawn 或半路抢占（#6/#15）
+      beginKernelMaintenance();
+      try {
+        await stopKernel();
+        await sleep(2000);
+        const k = await startKernel();
+        // reused = 8420 上有外部/未死透的内核：新配置根本没重载，
+        // 旧版静默 ok:true 是假成功，必须响（#7）
+        if (!k.started && k.reused) {
+          json(res, 200, { ok: true, warning: "检测到外部内核，新配置未重载；请先停止外部内核再保存", kernel: k });
+          return;
+        }
+        // httpBridge 开关即效（#8）：保存后不用重启 web 就起停桥
+        if (httpBridge !== undefined) {
+          if (httpBridge) await startHttpBridge().catch(() => {});
+          else stopHttpBridge();
+        }
+        json(res, 200, {
+          ok: true, kernel: k,
+          httpBridge: { running: httpBridgeRunning(), enabled: httpBridge !== undefined ? !!httpBridge : loadAppConfig()?.httpBridge === true },
+        });
+      } finally {
+        endKernelMaintenance();
+      }
       return;
     }
 
@@ -239,19 +282,19 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === "/api/kernel/stop" && req.method === "POST") {
       kernelStoppedByUser = true; // 手动停止：看护不插手，直到用户点启动
       kernelHealthMiss = 0;
-      json(res, 200, { stopped: stopKernel() });
+      json(res, 200, { stopped: await stopKernel() });
       return;
     }
 
     // 开机自启 + watchdog（UI 按钮开关）
     if (url.pathname === "/api/autostart" && req.method === "GET") {
-      json(res, 200, autostartStatus());
+      json(res, 200, await autostartStatus());
       return;
     }
     if (url.pathname === "/api/autostart" && req.method === "POST") {
       const { enable } = await readBody(req);
       if (typeof enable !== "boolean") { json(res, 400, { ok: false, error: "缺 enable" }); return; }
-      json(res, 200, setAutostart(enable));
+      json(res, 200, await setAutostart(enable));
       return;
     }
 
@@ -415,7 +458,9 @@ const server = http.createServer(async (req, res) => {
 
     if (url.pathname === "/api/shutdown" && req.method === "POST") {
       json(res, 200, { ok: true });
-      stopKernel();
+      // #43：停核最多等 5s——队列里可能压着最长 60s 的 startKernel，
+      // 停机路径干等会把退出拖死；超时也继续停桥+退出流程
+      await Promise.race([stopKernel(), sleep(5000)]);
       stopHttpBridge();
       setTimeout(() => process.exit(0), 300).unref();
       return;
@@ -444,7 +489,7 @@ const server = http.createServer(async (req, res) => {
 
     // ---- 卸载 ----
     if (url.pathname === "/api/uninstall/plan" && req.method === "GET") {
-      json(res, 200, { ok: true, ...uninstallPlan() });
+      json(res, 200, { ok: true, ...(await uninstallPlan()) });
       return;
     }
 
@@ -479,7 +524,16 @@ process.on("uncaughtException", (e) => {
 });
 
 // 今日统计采样：L0 总条数（v3 count）+ 内核 /health 的提炼计数器，交累加器算差量
-async function sampleDailyStats() {
+// 单飞（#44）：页面刷新与 20s 轮询并发时旧版两条采样叠加跑——updateDaily 非原子
+//（load→累加→save），同一增量被加两次，今日统计虚高
+let dailyStatsInflight = null;
+function sampleDailyStats() {
+  if (dailyStatsInflight) return dailyStatsInflight;
+  dailyStatsInflight = _sampleDailyStats().finally(() => { dailyStatsInflight = null; });
+  return dailyStatsInflight;
+}
+
+async function _sampleDailyStats() {
   try {
     const [l0r, h] = await Promise.all([
       gatewayData("/v3/conversation/count", {}, true).catch(() => null),
@@ -488,7 +542,7 @@ async function sampleDailyStats() {
     const pw = h?.body?.services?.pipelineWorker; // health() 返回 {ok,status,body} 包装，真身在 body
     // 看护计数：采到健康就归零，连续 miss 到阈值交给 watchdogKernel 决断
     if (h?.ok) kernelHealthMiss = 0; else kernelHealthMiss++;
-    if (kernelHealthMiss >= 2) await watchdogKernel();
+    if (kernelHealthMiss >= 2) watchdogKernel().catch(() => {}); // #44：不阻塞本次 GET——旧版 await 让 /api/daily-stats 随启核挂起最长 60s
     const l0Total = l0r?.body?.data?.total;
     if (typeof l0Total !== "number" && !pw) return getDaily(); // 内核不在：不采样，返回累计值
     return updateDaily({ l0Total, tasksDone: pw?.tasksCompleted, tasksFailed: pw?.tasksFailed });
@@ -509,6 +563,7 @@ let kernelLastRestartAt = 0;
 
 async function watchdogKernel() {
   if (kernelStoppedByUser || kernelRestarting) return;
+  if (kernelInMaintenance()) return; // #15：备份/卸载/配置重启维护窗内，看护不许抢启
   if (!loadAppConfig()) return; // 未完成向导：没有配置可拉，startKernel 会抛
   if (Date.now() - kernelLastRestartAt < 120_000) return; // 冷却中
   kernelRestarting = true;
@@ -533,8 +588,12 @@ server.listen(PORT, "127.0.0.1", () => {
   setInterval(() => { sampleDailyStats().catch(() => {}); }, 20000);
   // app 文件夹被移动后，开机自启 VBS 里的旧路径失效——静默重写（自愈）
   try { repairAutostartPath(); } catch { /* 自愈失败不影响启动 */ }
-  // HTTP 桥（豆包等只支持 URL 的客户端用）：随 web 起停
-  startHttpBridge().then((r) => console.log(`[AgentMemory Desktop] http-bridge ${r.started ? (r.healthy ? "up" : "starting...") : "reused/failed"}`)).catch(() => {});
+  // HTTP 桥（URL-only 客户端用）：默认关闭，app.json 配 "httpBridge": true 才随 web 起停
+  if (loadAppConfig()?.httpBridge === true) {
+    startHttpBridge().then((r) => console.log(`[AgentMemory Desktop] http-bridge ${r.started ? (r.healthy ? "up" : "starting...") : "reused/failed"}`)).catch(() => {});
+  } else {
+    console.log("[AgentMemory Desktop] http-bridge disabled (app.json httpBridge=false)");
+  }
   // watchdog/重启场景自愈：已完成配置但内核未运行时自动拉起
   // （内核是本进程的子进程，Web 被杀时内核会一起死，Web 复活后须重建）
   (async () => {

@@ -7,14 +7,24 @@ Set-Location $root
 $port = 8430
 $url = "http://127.0.0.1:$port"
 
-# Node: prefer bundled portable runtime, fallback to system node
+# Node: prefer bundled portable runtime, fallback to system node (verify PATH first)
 $nodeExe = Join-Path $root "runtime\node\node.exe"
-if (-not (Test-Path $nodeExe)) { $nodeExe = "node" }
+if (-not (Test-Path $nodeExe)) {
+    if (Get-Command node -ErrorAction SilentlyContinue) { $nodeExe = "node" }
+    else { Write-Host "[AgentMemory] Node runtime not found (bundled runtime/node missing, none on PATH)" -ForegroundColor Red; exit 1 }
+}
 
 function Test-PortListening($p) {
     $c = Get-NetTCPConnection -LocalPort $p -State Listen -ErrorAction SilentlyContinue
     return ($null -ne $c)
 }
+
+# Always clear the stop sentinel first - both "already running" and real start:
+# if start.bat runs while stop.bat's sentinel is fresh and 8430 not yet released,
+# the old logic exits 0 without deleting the sentinel; the leftover sentinel then
+# makes watchdog refuse to relaunch permanently (was only deleted on the real start path)
+$stoppedFlagEarly = Join-Path $root ".stopped"
+if (Test-Path $stoppedFlagEarly) { Remove-Item $stoppedFlagEarly -Force }
 
 # Already running: just open browser
 if (Test-PortListening $port) {
@@ -62,6 +72,6 @@ if ($ok) {
     }
 } else {
     Write-Host "[AgentMemory] FAILED to start. See logs\web.log" -ForegroundColor Red
-    if (Test-Path "$logFile.err") { Get-Content "$logFile.err" -Tail 20 }
+    if (Test-Path "$logFile.err") { Get-Content "$logFile.err" -Tail 20 -Encoding utf8 }
     exit 1
 }

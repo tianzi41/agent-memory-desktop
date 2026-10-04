@@ -1,24 +1,44 @@
 // importer.mjs — MD 批量导入管道：逐轮喂入 + 等待提炼节奏控制（Phase 0 发现 D/E 缓解）
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import { loadAppConfig } from "./kernel.mjs";
 import { configDir, writeFileAtomic } from "./config-gen.mjs";
 import { parseFile, parseDocChunks, sanitizeContent } from "./md-parser.mjs";
 import { parseJsonlFile } from "./tool-import.mjs";
 
+// 单文件读取上限（#49）：50MB 以上的 md 不整读——OOM 会拖垮整个 web 进程
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+
 // 已导入文件清单（去重标记）：data/config/imported-files.json，key = 文件绝对路径
 const IMPORTED_PATH = path.join(configDir(), "imported-files.json");
 export function loadImportedMap() {
   try { return JSON.parse(readFileSync(IMPORTED_PATH, "utf8")); } catch { return {}; }
 }
-// 清理失效条目：源文件被删/移动后标记还留着会误导"已导入"，扫描时顺手扫掉
+// key 形态推断（#13 迁移）：存量标记没有 kind 字段。tool 导入的 key 是
+// sessionKey（不是路径，existsSync 永远 false）——旧版 prune 把它们全删了，
+// 导致每次扫描触发重复全量导入。迁移规则：mode==="tool" → sessionKey；
+// 其余历史条目都是 MD 导入的绝对路径 → path。推断结果回写，迁移一次完成。
+function markKind(k, entry) {
+  if (entry && entry.kind) return entry.kind;
+  if (entry && entry.mode === "tool") return "sessionKey";
+  if (/^[A-Za-z]:[\\/]/.test(k) || k.includes("/") || k.includes("\\")) return "path";
+  return "sessionKey"; // 认不出形态的一律保留（宁可漏清，不可误删导致重导）
+}
+
+// 清理失效条目：只清 kind=path 且源文件已消失的；sessionKey 标记不碰
 export function pruneImportedMap() {
   const map = loadImportedMap();
-  let removed = 0;
+  let removed = 0, migrated = 0;
   for (const k of Object.keys(map)) {
-    if (!existsSync(k)) { delete map[k]; removed++; }
+    const entry = map[k] || {};
+    const kind = markKind(k, entry);
+    if (entry.kind !== kind) { map[k] = { ...entry, kind }; migrated++; }
+    if (kind === "path" && !existsSync(k)) { delete map[k]; removed++; }
   }
-  if (removed) saveImportedMap(map);
+  // 直接原子写，不走 saveImportedMap 的合并——合并会以 {...磁盘旧状态, ...新map}
+  // 的顺序把刚删掉的死条目从磁盘 merge 回来，prune 的删除永远落不了地。
+  // 并发安全性由导入任务侧的 saveImportedMap 保证：任务快照后写时自己的标记优先。
+  if (removed || migrated) writeFileAtomic(IMPORTED_PATH, JSON.stringify(map, null, 2));
   return removed;
 }
 function saveImportedMap(map) {
@@ -71,9 +91,22 @@ async function gwCaptureOnce(sessionKey, user, assistant) {
   return ok ? true : status;
 }
 
+// 提炼基线（#14）：health 失败时重试而非回落 0——回落 0 会让
+// waitPipelineSettled 的 done>base 恒真，"等提炼完"被静默跳过
+async function readPipelineBaseline() {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const h = await gwHealth().catch(() => null);
+    const done = h?.services?.pipelineWorker?.tasksCompleted;
+    if (typeof done === "number") return done;
+    await sleep(2000);
+  }
+  return null; // 三次都拿不到：调用方按"基线缺失"处理（宁可靠等，不假完成）
+}
+
 // 带重试的 capture：网络/超时类失败等 20s 重试（最多 4 次）；400 是确定性失败不重试
 async function gwCapture(sessionKey, user, assistant) {
   for (let attempt = 1; attempt <= 4; attempt++) {
+    if (!state.running) return false; // #39：用户中止后不再继续重试灌库（旧版最长再灌约 60s）
     let res;
     try { res = await gwCaptureOnce(sessionKey, user, assistant); } catch { res = false; }
     if (res === true) return true;
@@ -88,12 +121,17 @@ async function gwCapture(sessionKey, user, assistant) {
 // （L1 提炼任务完成即计数，无论成功失败；上限 200s > 内核 180s 硬编码超时）
 async function waitPipelineSettled(baseCompleted, maxMs = 200_000) {
   const start = Date.now();
+  let base = baseCompleted;
   while (Date.now() - start < maxMs) {
     await sleep(3000);
     if (!state.running) return false; // 被中止：立刻退，不再干等满 200s
     const h = await gwHealth().catch(() => null);
     const done = h?.services?.pipelineWorker?.tasksCompleted;
-    if (typeof done === "number" && done > baseCompleted) return true;
+    if (typeof done !== "number") continue;
+    // #14：基线缺失（health 当时挂了）或计数器归零（内核重启）——
+    // 以首次读到的值为基线等增量，而不是立即判完成（旧版 base=0 时恒真）
+    if (base === null || done < base) base = done;
+    if (done > base) return true;
   }
   return false;
 }
@@ -104,7 +142,7 @@ function pushFailure(f) {
 }
 
 // 导出内部辅助函数，供 tool-import 流水线复用（同一套 capture/等待/去重/状态机）
-export { gwHealth, gwCapture, waitPipelineSettled, pushFailure, state, saveImportedMap };
+export { gwHealth, gwCapture, waitPipelineSettled, readPipelineBaseline, pushFailure, state, saveImportedMap };
 
 // 会话标识生成：聊天记录按文件名、文档加 import-doc- 前缀（预览与实导共用同一份逻辑，保证所见即所得）
 function makeSessionKey(file, isChat) {
@@ -184,7 +222,11 @@ export async function startImport(files) {
 
         // 读文件 → 按格式分流：### 用户· = 聊天记录；否则按普通文档切块
         let text = "";
-        try { text = readFileSync(file, "utf8"); }
+        try {
+          // 大小闸：GB 级 md 整读进内存会 OOM 拖垮 web，同步读还长时间阻塞事件循环
+          if (statSync(file).size > MAX_FILE_BYTES) throw new Error("文件超过 50MB 上限，跳过");
+          text = readFileSync(file, "utf8");
+        }
         catch (e) { pushFailure({ file, round: 0, error: "读取失败: " + e.message }); state.done++; continue; }
 
         let isChat = false, sessionKey = "", total = 0, feed = []; // feed: [{user, assistant}]
@@ -207,7 +249,7 @@ export async function startImport(files) {
         for (let i = 0; i < feed.length; i++) {
           if (!state.running) break;
           state.currentRound = i + 1;
-          const base = (await gwHealth().catch(() => null))?.services?.pipelineWorker?.tasksCompleted ?? 0;
+          const base = await readPipelineBaseline();
           const capOk = await gwCapture(sessionKey, feed[i].user, feed[i].assistant).catch(() => false);
           if (!capOk) {
             pushFailure({ file, round: i + 1, error: "capture 请求失败" });
@@ -223,6 +265,7 @@ export async function startImport(files) {
         // 半途文件下次扫描时按"未导入"重新全量导入，避免只导了一半却显示已导入
         if (state.running) {
           importedMap[file] = {
+            kind: "path", // #13：prune 只按 kind=path 检查存在性
             mode: isChat ? "chat" : "doc",
             rounds: total, importedAt: new Date().toISOString(),
             failCount: state.failures.filter(f => f.file === file).length,
@@ -280,7 +323,7 @@ export async function startToolImport(projects) {
         for (let i = 0; i < feed.length; i++) {
           if (!state.running) break;
           state.currentRound = i + 1;
-          const base = (await gwHealth().catch(() => null))?.services?.pipelineWorker?.tasksCompleted ?? 0;
+          const base = await readPipelineBaseline();
           const capOk = await gwCapture(sessionKey, feed[i].user, feed[i].assistant).catch(() => false);
           if (!capOk) {
             pushFailure({ file: state.currentFile, round: i + 1, error: "capture 请求失败" });
@@ -294,6 +337,7 @@ export async function startToolImport(projects) {
         // 项目级去重标记：key 用 sessionKey（全局唯一），记录来源/项目/轮数
         if (state.running) {
           importedMap[sessionKey] = {
+            kind: "sessionKey", // #13：不是路径，prune 永远不按存在性清它
             mode: "tool",
             source: proj.source,
             project: proj.project,

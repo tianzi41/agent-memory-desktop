@@ -1,5 +1,6 @@
 // inject.mjs — 客户端检测与 MCP 配置注入（写入前一律先备份原件）
-import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, copyFileSync, readdirSync, rmSync } from "node:fs";
+import { writeFileAtomic } from "./config-gen.mjs";
 import path from "node:path";
 
 const ROOT = path.resolve(import.meta.dirname, "..", "..");
@@ -23,8 +24,14 @@ function backupFile(file) {
   if (!existsSync(file)) return null;
   mkdirSync(BACKUP_DIR, { recursive: true });
   const ts = new Date().toISOString().replaceAll(":", "-").replaceAll(".", "-");
-  const dst = path.join(BACKUP_DIR, `${path.basename(file)}.${ts}.bak`);
+  const base = path.basename(file);
+  const dst = path.join(BACKUP_DIR, `${base}.${ts}.bak`);
   copyFileSync(file, dst);
+  // 轮换：同一客户端只保留最近 5 份，否则反复注入/反注入会把 backup 目录撑爆
+  const olds = readdirSync(BACKUP_DIR).filter((n) => n.startsWith(base + ".") && n.endsWith(".bak")).sort();
+  for (const n of olds.slice(0, Math.max(0, olds.length - 5))) {
+    try { rmSync(path.join(BACKUP_DIR, n), { force: true }); } catch { /* 清理失败不致命 */ }
+  }
   return dst;
 }
 
@@ -76,7 +83,7 @@ function injectToConfigFile(configFile, gatewayUrl) {
 
   const dir = path.dirname(configFile);
   mkdirSync(dir, { recursive: true });
-  writeFileSync(configFile, JSON.stringify(json, null, 2), "utf8");
+  writeFileAtomic(configFile, JSON.stringify(json, null, 2)); // 原子写：崩溃/断电不会把第三方配置写成半个 JSON
   return { ok: true, file: configFile, existed, backup };
 }
 
@@ -103,7 +110,7 @@ function removeFromConfigFile(configFile) {
   const json = readJson(configFile);
   const had = !!(json.mcpServers && json.mcpServers["agent-memory"]);
   if (json.mcpServers) delete json.mcpServers["agent-memory"];
-  writeFileSync(configFile, JSON.stringify(json, null, 2), "utf8");
+  writeFileAtomic(configFile, JSON.stringify(json, null, 2)); // 原子写：同上
   return { ok: true, file: configFile, existed: true, removed: had, backup };
 }
 

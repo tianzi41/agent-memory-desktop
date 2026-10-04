@@ -42,7 +42,8 @@ function redactSecrets(text) {
 // （只认"盘符: 后跟反斜杠段"的完整路径；段内允许空格与中文以兼容中文目录，
 //  遇引号/换行/通配符即停，孤立 \d \n \frac 等代码转义不受影响）
 function normalizeWinPaths(text) {
-  return text.replace(/([A-Za-z]):((?:\\+[^\\"'`|<>*?\r\n]+)+)/g, (m, drive, rest) => drive + ":" + rest.replace(/\\+/g, "/"));
+  // 负向断言：单字母盘符前不能再跟标识符字符，否则 version:\1 这类文本会被误改写
+  return text.replace(/(?<![A-Za-z0-9_])[A-Za-z]:((?:\\+[^\\"'`|<>*?\r\n]+)+)/g, (m, drive, rest) => drive + ":" + rest.replace(/\\+/g, "/"));
 }
 
 export function sanitizeContent(text) {

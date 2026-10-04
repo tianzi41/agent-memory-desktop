@@ -10,7 +10,14 @@ function Test-PortListening($p) {
     return ($null -ne $c)
 }
 
-Write-Host "[AgentMemory watchdog] started (check every 30s, port $port)"
+$logFile = Join-Path $root "logs\watchdog.log"
+function WLog($msg) {
+    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $msg
+    Write-Host $line
+    try { Add-Content -Path $logFile -Value $line -Encoding utf8 } catch { /* log write failure is not fatal */ }
+}
+
+WLog "[AgentMemory watchdog] started (check every 30s, port $port)"
 
 $stoppedFlag = Join-Path $root ".stopped"
 
@@ -20,12 +27,22 @@ while ($true) {
     if (Test-Path $stoppedFlag) { continue }
     if (Test-PortListening $port) { continue }
 
-    Write-Host "[AgentMemory watchdog] port $port down - relaunching..."
+    WLog "port $port down - relaunching..."
+    $launcherPath = Join-Path $root "launcher.ps1"
+    # Quote the path explicitly: PS 5.1 does not auto-quote ArgumentList elements
+    # containing spaces - an install path with spaces makes the inner powershell
+    # fail with "file does not have a '.ps1' extension"
     Start-Process powershell -ArgumentList @(
         "-NoProfile", "-ExecutionPolicy", "Bypass",
-        "-File", (Join-Path $root "launcher.ps1"), "-NoBrowser"
+        "-File", ('"{0}"' -f $launcherPath), "-NoBrowser"
     ) -WindowStyle Hidden
 
-    # give the relaunch time to settle before checking again
-    Start-Sleep -Seconds 120
+    # #27: probe the port instead of blindly sleeping 120s - a failed relaunch
+    # still costs the full window, a successful one resumes watching immediately
+    $elapsed = 0
+    while ($elapsed -lt 120 -and -not (Test-PortListening $port)) {
+        Start-Sleep -Seconds 2
+        $elapsed += 2
+    }
+    WLog ("relaunch settled={0} after ~{1}s" -f (Test-PortListening $port), $elapsed)
 }

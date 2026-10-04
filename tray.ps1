@@ -2,6 +2,10 @@
 # Left-click: open Web UI. Right-click menu: Open / Exit.
 # Started/Stopped together with watchdog via the autostart toggle in Web UI.
 $ErrorActionPreference = "Continue"
+# Single-instance guard: named Mutex. Autostart + manual double-start used to
+# spawn two tray icons, and exiting only closed one of them.
+$mutex = New-Object System.Threading.Mutex($true, "AgentMemoryDesktopTray")
+if (-not $mutex.WaitOne(0, $false)) { Write-Host "[AgentMemory tray] already running, exiting"; exit }
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
