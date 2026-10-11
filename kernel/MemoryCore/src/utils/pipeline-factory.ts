@@ -409,6 +409,8 @@ export function createL1Runner(opts: {
   /** True iff the over-fetch returned exactly L1_BATCH_QUERY rows (i.e. likely large backlog). */
   hasFullBacklog: boolean;
   profileScopes: string[];
+  /** 本批中提炼瞬态失败（LLM 输出异常）的组数；>0 时 cursor 未推进，下轮重试。 */
+  transientFailures: number;
 }> {
   const { pluginDataDir, cfg, openclawConfig, vectorStore, embeddingService, logger, getInstanceId, llmRunner, storage, checkpointLock } = opts;
   const config = openclawConfig as Record<string, unknown> | undefined;
@@ -416,7 +418,7 @@ export function createL1Runner(opts: {
   return async ({ sessionKey }) => {
     if (!config && !llmRunner) {
       logger.debug?.(`${TAG} [l1] No OpenClaw config and no LLM runner, skipping L1 extraction`);
-      return { processedCount: 0, storedCount: 0, hasMore: false, hasFullBacklog: false, profileScopes: [] };
+      return { processedCount: 0, storedCount: 0, hasMore: false, hasFullBacklog: false, profileScopes: [], transientFailures: 0 };
     }
 
     const checkpoint = new CheckpointManager(pluginDataDir, logger, storage, checkpointLock);
@@ -588,6 +590,7 @@ export function createL1Runner(opts: {
 
       let totalExtracted = 0;
       let totalStored = 0;
+      let transientFailures = 0;
       let lastSceneName: string | undefined;
       const profileScopes = new Set<string>();
       const l1PromptTargets = groups.map((group) => ({
@@ -636,6 +639,15 @@ export function createL1Runner(opts: {
 
         totalExtracted += l1Result.extractedCount;
         totalStored += l1Result.storedCount;
+        // orphan-fix：瞬态失败（LLM 输出被截断/格式错/调用异常）不计入
+        // 合法空——empty_scenes 是 LLM 确实认为无可提炼，照常推进 cursor。
+        if (
+          l1Result.extractedCount === 0 &&
+          l1Result.emptyReason !== undefined &&
+          l1Result.emptyReason !== "empty_scenes"
+        ) {
+          transientFailures++;
+        }
         if (l1Result.storedCount > 0) {
           // L2/L3 output is team+agent scoped, but each L2 extraction input must
           // stay bounded to the source session that just produced L1. Encode the
@@ -656,12 +668,24 @@ export function createL1Runner(opts: {
       // Use maxRecordedAtMs (write time) of the **processed** slice as cursor —
       // always positive, TCVDB-safe. Boundary alignment guarantees we will not
       // skip same-ms siblings on the next round.
-      await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, maxRecordedAtMs || undefined, lastSceneName);
+      //
+      // orphan-fix：任一组瞬态失败（emptyReason ∈ no_json/parse_fail/not_array/
+      // llm_error，重试已耗尽）时**不推进 cursor**——旧版无条件前移，失败组的
+      // L0 记录永远滞留（10-05/10-11 两次孤儿事故根因）。下一轮 idle 计时器
+      // 从旧 cursor 重跑，已存储的组由 batchDedup 去重跳过。合法空
+      // （empty_scenes）照常推进。
+      if (transientFailures > 0) {
+        logger.warn(
+          `${TAG} [l1] ${transientFailures}/${groups.length} 组瞬态失败，cursor 保持 ${runnerState.last_l1_cursor || "(start)"} 不前移，下轮重试同一批 L0`,
+        );
+      } else {
+        await checkpoint.markL1ExtractionComplete(sessionKey, totalStored, maxRecordedAtMs || undefined, lastSceneName);
+      }
       logger.info(
-        `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored} (${groups.length} group(s))`,
+        `${TAG} [l1] L1 complete: extracted=${totalExtracted}, stored=${totalStored}, transientFailures=${transientFailures} (${groups.length} group(s))`,
       );
 
-      return { processedCount: totalMessages, storedCount: totalStored, hasMore, hasFullBacklog, profileScopes: Array.from(profileScopes) };
+      return { processedCount: totalMessages, storedCount: totalStored, hasMore, hasFullBacklog, profileScopes: Array.from(profileScopes), transientFailures };
     } catch (err) {
       logger.error(`${TAG} [l1] L1 failed: ${err instanceof Error ? err.stack ?? err.message : String(err)}`);
       throw err;

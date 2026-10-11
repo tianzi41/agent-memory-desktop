@@ -654,7 +654,17 @@ export function parseConfig(raw: Record<string, unknown> | undefined): MemoryTda
         baseUrl: str(llmGroup, "baseUrl") ?? "https://api.openai.com/v1",
         apiKey: str(llmGroup, "apiKey") ?? "",
         model: str(llmGroup, "model") ?? "gpt-4o",
-        maxTokens: num(llmGroup, "maxTokens") ?? 4096,
+        maxTokens: (() => {
+          // orphan-fix：与 gateway/config.ts 的顶层 llm 对齐——env 优先，
+          // 否则 yaml 值，最后 4096。推理模型（step-3.7-flash 等）的
+          // reasoning 与 content 分离计费，4096 会被推理段吃光导致提取
+          // content 为空（l1-empty reason=no_json，记录滞留 L0）。
+          const fromEnv = process.env.TDAI_LLM_MAX_TOKENS;
+          if (fromEnv !== undefined && fromEnv !== "" && !Number.isNaN(Number(fromEnv))) {
+            return Number(fromEnv);
+          }
+          return num(llmGroup, "maxTokens") ?? 4096;
+        })(),
         timeoutMs: num(llmGroup, "timeoutMs") ?? 120_000,
         provider,
         stream: bool(llmGroup, "stream") ?? false,

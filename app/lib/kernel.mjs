@@ -104,6 +104,11 @@ async function _startKernel() {
     TDAI_LLM_API_KEY: cfg.apiKey,
     TDAI_LLM_BASE_URL: cfg.baseUrl,
     TDAI_LLM_MODEL: cfg.model,
+    // 输出预算（orphan-fix）：step-3.7-flash 等推理模型的 reasoning_content 与
+    // content 分离计费，默认 4096 时提取 prompt 稍复杂就把预算烧光在推理段、
+    // content 变空/截断（表现为 l1-empty reason=no_json/parse_fail，记录滞留 L0）。
+    // app.json 的 llmMaxTokens 可覆盖；实测 StepFun 接受 16384 且产出过 4847 token。
+    TDAI_LLM_MAX_TOKENS: String(cfg.llmMaxTokens ?? 16384),
   };
 
   const logPath = path.join(ROOT, "logs", "kernel.log");

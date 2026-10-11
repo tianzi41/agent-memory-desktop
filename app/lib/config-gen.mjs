@@ -60,7 +60,7 @@ function replaceYamlScalar(yaml, key, value) {
   return { yaml: yaml.replace(re, (m, p1) => p1 + '"' + value + '"'), hit: true };
 }
 
-export function generateYaml({ baseUrl, model, dataDir, port = 8420 }) {
+export function generateYaml({ baseUrl, model, dataDir, port = 8420, maxTokens = 16384 }) {
   const baseDir = (dataDir || defaultDataDir()).replaceAll("\\", "/");
   // 导入友好默认：每 2 轮触发提炼、空闲 60s 兜底（Phase 0 发现 E 的缓解）
   return `# AgentMemory Desktop 生成的内核配置（首启向导）
@@ -78,7 +78,7 @@ llm:
   baseUrl: "${baseUrl}"
   apiKey: "\${TDAI_LLM_API_KEY}"
   model: "${model}"
-  maxTokens: 4096
+  maxTokens: ${maxTokens}
   timeoutMs: 120000
 
 memory:

@@ -74,6 +74,13 @@ export interface L1ExtractionResult {
   sceneNames: string[];
   /** Last scene name (for continuity in next extraction) */
   lastSceneName?: string;
+  /**
+   * Populated iff the run ended with 0 memories — the machine-readable WHY.
+   * Callers (pipeline-factory) use it to decide cursor advancement: transient
+   * reasons (no_json/parse_fail/not_array/llm_error) must NOT advance the L1
+   * cursor, otherwise the records stay orphaned in L0.
+   */
+  emptyReason?: L1EmptyReason | "normalized_all_dropped";
 }
 
 // ============================
@@ -213,7 +220,7 @@ export async function extractL1Memories(params: {
     logger?.warn?.(
       `${TAG} l1-empty reason=llm_error sessionKey=${sessionKey} msg=${err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200)}`,
     );
-    return { success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [] };
+    return { success: false, extractedCount: 0, storedCount: 0, records: [], sceneNames: [], emptyReason: "llm_error" };
   }
 
   // Flatten all memories across scenes
@@ -276,6 +283,7 @@ export async function extractL1Memories(params: {
       storedCount: 0,
       records: [],
       sceneNames,
+      emptyReason: finalReason,
       lastSceneName: sceneNames[sceneNames.length - 1],
     };
   }
@@ -503,40 +511,76 @@ async function callLlmExtraction(params: {
     `${TAG} [l1-debug] ENTRY taskId=l1-extraction, promptMode=${promptMode}, newMsgs=${newMessages.length}, bgMsgs=${backgroundMessages.length}, userPromptLen=${userPrompt.length}, sysPromptLen=${systemPrompt.length}, model=${model ?? "(default)"}, previousSceneName=${previousSceneName ? JSON.stringify(previousSceneName) : "(none)"}, runnerKind=${llmRunner ? "llmRunner" : "CleanContextRunner"}`,
   );
 
-  let result: string;
-
   // langfuse trace 语义：让此次 L1 抽取在 UI 有稳定 name / 顶级 user/session 列
   // / 可筛选 tags。避免所有记忆抽取都显示为 Unnamed trace。
   const traceParams = buildTraceParams("memory.l1-extract", traceContext);
 
-  if (llmRunner) {
-    // Use the host-neutral LLMRunner interface
-    result = await llmRunner.run({
-      prompt: userPrompt,
-      systemPrompt,
-      taskId: "l1-extraction",
-      timeoutMs: 180_000,
-      ...traceParams,
-    });
-  } else {
-    // Fallback: create CleanContextRunner (OpenClaw path)
-    const runner = new CleanContextRunner({
-      config,
-      modelRef: model,
-      enableTools: false,
-      logger,
-    });
+  // 瞬态重试（orphan-fix）：推理模型（step-3.7-flash 等）输出预算吃紧时会把
+  // content 截断/清空/写出不合法 JSON——parse 侧表现为 no_json/parse_fail/
+  // not_array。这类失败重试大概率一次就好（smoke 的同款机制两次实战立功）。
+  // 合法空（empty_scenes：LLM 确实认为无可提炼）不重试，重试纯烧钱。
+  const MAX_ATTEMPTS = 3;
+  const TRANSIENT_REASONS = new Set(["no_json", "parse_fail", "not_array"]);
+  let lastOutcome: ParseExtractionOutcome = { scenes: [], emptyReason: "no_json" };
 
-    result = await runner.run({
-      prompt: userPrompt,
-      systemPrompt,
-      taskId: "l1-extraction",
-      timeoutMs: 180_000,
-      ...traceParams,
-    });
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const promptForAttempt = attempt === 1
+      ? userPrompt
+      : `${userPrompt}\n\n【系统重试通知】你上一次的输出被截断或不是合法 JSON（${lastOutcome.emptyReason ?? "unknown"}）。请停止过度思考，直接输出完整、合法的 JSON 数组，不要输出任何解释、前缀或后缀文字。`;
+
+    let result: string;
+    try {
+      if (llmRunner) {
+        // Use the host-neutral LLMRunner interface
+        result = await llmRunner.run({
+          prompt: promptForAttempt,
+          systemPrompt,
+          taskId: "l1-extraction",
+          timeoutMs: 300_000,
+          ...traceParams,
+        });
+      } else {
+        // Fallback: create CleanContextRunner (OpenClaw path)
+        const runner = new CleanContextRunner({
+          config,
+          modelRef: model,
+          enableTools: false,
+          logger,
+        });
+
+        result = await runner.run({
+          prompt: promptForAttempt,
+          systemPrompt,
+          taskId: "l1-extraction",
+          timeoutMs: 300_000,
+          ...traceParams,
+        });
+      }
+    } catch (err) {
+      // LLM 调用本身异常（超时/网络/5xx）。最后一次尝试抛给上层
+      // （extractL1Memories 的 catch 记 llm_error 且不推进 cursor）。
+      if (attempt === MAX_ATTEMPTS) throw err;
+      logger?.warn?.(
+        `${TAG} LLM 调用异常（第 ${attempt}/${MAX_ATTEMPTS} 次尝试）: ${err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160)}`,
+      );
+      continue;
+    }
+
+    const outcome = parseExtractionResult(result, logger);
+    if (!outcome.emptyReason || !TRANSIENT_REASONS.has(outcome.emptyReason)) {
+      return outcome;
+    }
+
+    lastOutcome = outcome;
+    if (attempt < MAX_ATTEMPTS) {
+      logger?.warn?.(
+        `${TAG} 瞬态解析失败 reason=${outcome.emptyReason}（第 ${attempt}/${MAX_ATTEMPTS} 次尝试），加重试提示后重跑`,
+      );
+    }
   }
 
-  return parseExtractionResult(result, logger);
+  logger?.warn?.(`${TAG} 连续 ${MAX_ATTEMPTS} 次瞬态失败（reason=${lastOutcome.emptyReason}），放弃本轮`);
+  return lastOutcome;
 }
 
 /**
@@ -624,10 +668,9 @@ function parseExtractionResult(raw: string, logger?: Logger): ParseExtractionOut
     try {
       parsed = JSON.parse(sanitized) as unknown[];
     } catch (err) {
-      const repaired = repairExtractionJson(sanitized);
-      if (repaired === sanitized) throw err;
-      parsed = JSON.parse(repaired) as unknown[];
-      logger?.warn?.(`${TAG} Repaired non-strict extraction JSON: ${err instanceof Error ? err.message : String(err)}`);
+      const salvaged = salvageTruncatedJson(sanitized, logger);
+      if (!salvaged) throw err;
+      parsed = salvaged;
     }
 
     if (!Array.isArray(parsed)) {
@@ -678,6 +721,63 @@ function repairExtractionJson(json: string): string {
       (_m, prefix: string) => `${prefix}50`,
     )
     .replace(/,\s*([}\]])/g, "$1");
+}
+
+/**
+ * 打捞被 max_tokens 截断的提取 JSON（orphan-fix）。
+ * 推理模型输出预算吃紧时，JSON 数组写到一半被砍是常态（线上见过 rawLen=32/743/1629）。
+ * 按代价从低到高依次尝试：
+ *   1. 去掉尾部不完整的 "key": 残片后做字段修复+括号配平
+ *   2. 纯括号配平
+ *   3. 纯字段修复
+ * 任一候选能 parse 成数组即返回；全部失败返回 null（交回 parse_fail）。
+ */
+function salvageTruncatedJson(json: string, logger?: Logger): unknown[] | null {
+  const dropDanglingKey = (s: string): string =>
+    s
+      .replace(/,\s*"[^"]*"\s*:\s*$/, "")
+      .replace(/"[^"]*"\s*:\s*$/, "");
+  const candidates: Array<[string, string]> = [
+    ["repair+balance", balanceJsonBrackets(repairExtractionJson(dropDanglingKey(json)))],
+    ["balance", balanceJsonBrackets(json)],
+    ["repair", repairExtractionJson(json)],
+  ];
+  for (const [label, candidate] of candidates) {
+    if (!candidate || candidate === json) continue;
+    try {
+      const parsed = JSON.parse(candidate);
+      if (Array.isArray(parsed)) {
+        logger?.warn?.(`${TAG} Salvaged truncated extraction JSON via ${label}`);
+        return parsed;
+      }
+    } catch {
+      // 换下一个候选
+    }
+  }
+  return null;
+}
+
+/**
+ * 字符串感知的括号配平：扫描时跳过字符串字面量内的括号，末尾按栈逆序补
+ * 缺失的 }/]。截断点落在字符串中间时先补一个引号闭合。
+ */
+function balanceJsonBrackets(json: string): string {
+  const stack: string[] = [];
+  let inStr = false;
+  let escaped = false;
+  for (const ch of json) {
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') inStr = true;
+    else if (ch === "{" || ch === "[") stack.push(ch === "{" ? "}" : "]");
+    else if (ch === "}" || ch === "]") stack.pop();
+  }
+  const closers = stack.reverse().join("");
+  return inStr ? json + '"' + closers : json + closers;
 }
 
 // ============================
