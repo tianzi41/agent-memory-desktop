@@ -43,7 +43,10 @@ function redactSecrets(text) {
 //  遇引号/换行/通配符即停，孤立 \d \n \frac 等代码转义不受影响）
 function normalizeWinPaths(text) {
   // 负向断言：单字母盘符前不能再跟标识符字符，否则 version:\1 这类文本会被误改写
-  return text.replace(/(?<![A-Za-z0-9_])[A-Za-z]:((?:\\+[^\\"'`|<>*?\r\n]+)+)/g, (m, drive, rest) => drive + ":" + rest.replace(/\\+/g, "/"));
+  // 正则只有一个捕获组（反斜杠段），盘符+冒号取 m 前两位——旧版回调签名写成
+  // (m, drive, rest) 三参，rest 恒为 undefined，遇到 盘符:\路径 就抛
+  // "rest.replace is not a function"（导入解析全批失败，线上已撞到两次）
+  return text.replace(/(?<![A-Za-z0-9_])[A-Za-z]:((?:\\+[^\\"'`|<>*?\r\n]+)+)/g, (m, rest) => m.slice(0, 2) + rest.replace(/\\+/g, "/"));
 }
 
 export function sanitizeContent(text) {
