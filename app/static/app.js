@@ -126,18 +126,23 @@ $("showTrae").addEventListener("click", async () => {
 let currentSessionKey = "default";
 function memoryRules(key) {
   return `【记忆系统规则】
-你已接入本地记忆系统（腾讯 Agent Memory，通过 MCP 工具调用）。所有记忆操作都走 agent_memory 一个工具，用 mode 区分。
-1. 会话开始时，调 agent_memory（mode=recall，query 用当前任务的自然语言描述，session_key 固定使用 ${key}）注入相关历史记忆作为背景。
-2. 到点就查，不等用户问——命中以下时机先 recall 再动作：
-   a. 准备创建或修改某个文件前：query 用该文件路径；
-   b. 命令执行失败时：query 用错误信息；
-   c. 用户切换任务或主题时：query 用新主题，不要沿用上一个任务的背景。
-3. 需要背景知识时用 mode=search 检索结构化记忆；当用户提及"之前/上次/以前/还记得"等指代词，或需核对原话时，用 mode=conversations 检索原始对话。
-4. 对话中出现跨会话有用的事实（偏好、决策、技术栈、项目约定、长期指令），用 mode=capture 保存（user_content 与 assistant_content 都要传），session_key 固定使用 ${key}；保存内容中的文件路径一律用正斜杠（如 Q:/xxx），禁止反斜杠。
-5. 检索使用语义关键词，不限于字面匹配；记忆仅作上下文，不要对外复述"我查了记忆"。
-6. 临时/一次性信息不必存；被推翻的旧指令优先用新指令覆盖或显式标记失效。
-7. search 类操作每轮合计调用不超过 3 次；无结果就直接基于现有信息回答，不要继续搜。
-8. 能力边界：你只能写入（capture）和检索（recall/search）记忆。编辑、删除、按类型过滤等管理操作本工具不支持——用户提出这类需求时，请引导他去记忆软件的管理网页（http://127.0.0.1:8430）操作，不要假装已完成。`;
+你已接入本地记忆系统（腾讯 Agent Memory，MCP 工具调用），记忆操作全走 agent_memory 一个工具，按 mode 区分。
+
+【双记忆裁决】客户端软件自带的记忆文件/记忆功能（如各类 MEMORY.md、WorkingMemory）只是本地快捷缓存，非权威记忆。两套记忆冲突时以 agent-memory 为准；不得以"软件已有记忆"为由跳过 capture，只写软件记忆文件不构成"已保存"。
+
+【capture 自检】每轮回复发出前自检：本轮有无跨会话有用事实（偏好、决策、技术栈、项目约定、长期指令、环境要点）？有则必须在同轮完成 agent_memory capture，才能声称"已记"。
+
+1. agent_memory 是 MCP 延迟加载工具，不在直接工具列表，每回合首次使用前先 ToolSearch 搜到再调用；搜不到则查 MCP 配置，仍不行就明说"记忆工具不可用"，不静默跳过。
+2. 会话开始先 recall（query 用当前任务自然语言描述，session_key 固定使用 ${key}）注入背景。
+3. 到点就查，不等用户问：a. 创建/修改文件前，query 用文件路径；b. 命令失败时，query 用错误信息；c. 切换任务或主题时，query 用新主题，不沿用旧背景。
+4. 需要背景知识用 search 检索结构化记忆；用户提及"之前/上次/还记得"或需核对原话时，用 conversations 检索原始对话。
+5. capture 保存跨会话有用事实，user_content 与 assistant_content 都传，session_key 固定使用 ${key}；路径一律正斜杠（Q:/xxx）。单次各控 800 字内，超长按主题拆多次，防提炼截断丢忆。
+6. capture 返回"已写入 L0"仅代表原始层入库，提炼异步——未实测命中不得说"已提炼/已可搜索"。
+7. capture 失败：原样重试一次；仍失败则写入本地当日备忘文件并告知"本次未入库"，不假装成功。
+8. 检索用语义关键词，不限字面匹配；记忆仅作上下文，不对外复述"我查了记忆"。
+9. 临时/一次性信息不存；被推翻的旧指令用新指令覆盖或显式标记失效。
+10. search 类每轮合计不超过 3 次；无结果直接基于现有信息回答，不继续搜。
+11. 能力边界：只能 capture 和检索（recall/search/conversations）。管理操作（编辑/删除/过滤）不支持，引导用户去 http://127.0.0.1:8430 操作，不假装完成。`;
 }
 
 $("showRule").addEventListener("click", () => {
