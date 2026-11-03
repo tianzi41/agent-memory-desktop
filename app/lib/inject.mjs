@@ -66,7 +66,7 @@ export function detectClients() {
     },
     trae: {
       name: "TRAE / TRAE CN",
-      installed: true, // 本机已装（当前就在用）
+      installed: existsSync(path.join(process.env.APPDATA, "Trae CN")) || existsSync(path.join(process.env.APPDATA, "Trae")),
       injectable: false, // 配置在设置中心 UI 管理，无本地文件可写
       note: "在 设置中心 → MCP → 手动添加 粘贴下方 JSON",
     },
