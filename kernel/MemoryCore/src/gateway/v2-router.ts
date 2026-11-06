@@ -1792,8 +1792,11 @@ async function handleScenarioLs(body: unknown, _auth: V2AuthContext, requestId: 
   // One-shot full listing (no pagination; marker-based pagination planned for phase 2)
   const backend = storage.getBackend();
   const result = await backend.listObjects(prefix, { recursive: true });
-  deps.logger.debug?.(`${TAG} [scenario/ls] listObjects returned ${result.entries.length} entries`);
-  const allEntries = result.entries;
+  // 只暴露真正的场景文件（.md）。atomic-write 是"写 tmp 再 rename"，
+  // 进程在两步之间被杀（LLM 超时/重启/断电）会残留
+  // `<name>.md.tmp.xxxxxx`——它们不是场景，不能进 UI 列表。
+  const allEntries = result.entries.filter((e) => e.isDirectory || e.key.endsWith(".md"));
+  deps.logger.debug?.(`${TAG} [scenario/ls] listObjects returned ${result.entries.length} entries, ${allEntries.length} after .md filter`);
 
   // Read scene_index.json for summary + created/updated lookup
   const { readSceneIndex } = await import("../core/scene/scene-index.js");
@@ -1853,7 +1856,9 @@ async function handleScenarioCount(body: unknown, _auth: V2AuthContext, requestI
     ? `${StoragePaths.sceneBlocksDir}${path_prefix}`
     : StoragePaths.sceneBlocksDir;
   const result = await storage.getBackend().listObjects(prefix, { recursive: true });
-  const total = result.entries.filter((e) => !e.isDirectory).length;
+  // 与 /scenario/ls 同口径：只数真正的 .md 场景文件，排除 atomic-write 的
+  // `<name>.md.tmp.xxxxxx` 崩溃残留，否则统计数会虚高。
+  const total = result.entries.filter((e) => !e.isDirectory && e.key.endsWith(".md")).length;
   return successEnvelope<CountData>({ total }, requestId);
 }
 

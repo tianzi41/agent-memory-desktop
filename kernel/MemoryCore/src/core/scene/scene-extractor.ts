@@ -324,12 +324,33 @@ export class SceneExtractor {
     try {
       let allFiles: string[];
       if (this.storage) {
-        allFiles = await this.storage.readdirNames(StoragePaths.sceneBlocksDir, ".md");
+        // 不传 suffix：拿全部条目，下面按规则分流（tmp 残留要删，非 .md 的跳过）
+        allFiles = await this.storage.readdirNames(StoragePaths.sceneBlocksDir);
       } else {
         const fs = await import("node:fs/promises");
-        allFiles = (await fs.default.readdir(sceneBlocksDir)).filter((f: string) => f.endsWith(".md"));
+        allFiles = await fs.default.readdir(sceneBlocksDir);
       }
       for (const file of allFiles) {
+        // atomic-write 崩溃残留：writeFile 与 rename 之间进程被杀（LLM 超时 /
+        // 重启 / 断电）会留下 `<name>.md.tmp.xxxxxx`。scene_blocks/ 没有启动
+        // 清理机制，只能在这里每次抽取时扫掉——否则它们会以假 L2 身份
+        // 出现在管理页（历史上漏过：UI 列表接口未过滤 .md 后缀）。
+        if (/\.md\.tmp\.[0-9a-f]+$/i.test(file)) {
+          try {
+            if (this.storage) {
+              await this.storage.unlink(`${StoragePaths.sceneBlocksDir}${file}`);
+            } else {
+              const fs = await import("node:fs/promises");
+              const path = await import("node:path");
+              await fs.default.unlink(path.default.join(sceneBlocksDir, file));
+            }
+            cleanedCount++;
+            this.logger?.debug?.(`${TAG} extract() removed stale atomic-write tmp: ${file}`);
+          } catch { /* 并发删除或已被 rename 消费，忽略 */ }
+          continue;
+        }
+        // 其余非 .md 文件不归 L2 管（保留，避免误删用户放的其他资产）
+        if (!file.endsWith(".md")) continue;
         let raw: string | null;
         if (this.storage) {
           raw = await this.storage.readFile(`${StoragePaths.sceneBlocksDir}${file}`);
